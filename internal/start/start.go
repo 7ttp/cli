@@ -527,16 +527,29 @@ EOF
 			fmt.Sprintf("GOTRUE_RATE_LIMIT_TOKEN_REFRESH=%v", utils.Config.Auth.RateLimit.TokenRefresh),
 			fmt.Sprintf("GOTRUE_RATE_LIMIT_OTP=%v", utils.Config.Auth.RateLimit.SignInSignUps),
 			fmt.Sprintf("GOTRUE_RATE_LIMIT_VERIFY=%v", utils.Config.Auth.RateLimit.TokenVerifications),
-			fmt.Sprintf("GOTRUE_RATE_LIMIT_SMS_SENT=%v", utils.Config.Auth.RateLimit.SmsSent),
-			fmt.Sprintf("GOTRUE_RATE_LIMIT_WEB3=%v", utils.Config.Auth.RateLimit.Web3),
-		}
+		fmt.Sprintf("GOTRUE_RATE_LIMIT_SMS_SENT=%v", utils.Config.Auth.RateLimit.SmsSent),
+		fmt.Sprintf("GOTRUE_RATE_LIMIT_WEB3=%v", utils.Config.Auth.RateLimit.Web3),
+	}
 
-		// Since signing key is validated by ResolveJWKS, simply read the key file.
-		if keys, err := afero.ReadFile(fsys, utils.Config.Auth.SigningKeysPath); err == nil && len(keys) > 0 {
-			env = append(env, "GOTRUE_JWT_KEYS="+string(keys))
+	if keys, err := afero.ReadFile(fsys, utils.Config.Auth.SigningKeysPath); err == nil && len(keys) > 0 {
+		env = append(env, "GOTRUE_JWT_KEYS="+string(keys))
+		algSet := map[string]bool{"HS256": true}
+		for _, key := range utils.Config.Auth.SigningKeys {
+			switch key.Algorithm {
+			case config.AlgRS256:
+				algSet["RS256"] = true
+			case config.AlgES256:
+				algSet["ES256"] = true
+			}
 		}
+		algorithms := make([]string, 0, len(algSet))
+		for alg := range algSet {
+			algorithms = append(algorithms, alg)
+		}
+		env = append(env, "GOTRUE_JWT_VALID_METHODS="+strings.Join(algorithms, ","))
+	}
 
-		if utils.Config.Auth.Email.Smtp != nil && utils.Config.Auth.Email.Smtp.Enabled {
+	if utils.Config.Auth.Email.Smtp != nil && utils.Config.Auth.Email.Smtp.Enabled {
 			env = append(env,
 				fmt.Sprintf("GOTRUE_RATE_LIMIT_EMAIL_SENT=%v", utils.Config.Auth.RateLimit.EmailSent),
 				fmt.Sprintf("GOTRUE_SMTP_HOST=%s", utils.Config.Auth.Email.Smtp.Host),
