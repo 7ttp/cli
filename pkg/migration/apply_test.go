@@ -110,6 +110,8 @@ func TestApplyMigrations(t *testing.T) {
 		mockMigrationHistory(conn).
 			Query("RESET ALL").
 			Reply("RESET").
+			Query(`SET search_path = "$user", public, extensions`).
+			Reply("SET").
 			Query(testSchema).
 			Reply("CREATE SCHEMA").
 			Query(INSERT_MIGRATION_VERSION, "0", "schema", []string{testSchema}).
@@ -147,7 +149,9 @@ func TestApplyMigrations(t *testing.T) {
 		defer conn.Close(t)
 		mockMigrationHistory(conn).
 			Query("RESET ALL").
-			Reply("RESET")
+			Reply("RESET").
+			Query(`SET search_path = "$user", public, extensions`).
+			Reply("SET")
 		// Run test
 		err := ApplyMigrations(context.Background(), pending, conn.MockClient(t), fsys)
 		// Check error
@@ -161,6 +165,8 @@ func TestApplyMigrations(t *testing.T) {
 		mockMigrationHistory(conn).
 			Query("RESET ALL").
 			Reply("RESET").
+			Query(`SET search_path = "$user", public, extensions`).
+			Reply("SET").
 			Query(testSchema).
 			ReplyError(pgerrcode.UndefinedTable, `relation "supabase_migrations.schema_migrations" does not exist`).
 			Query(INSERT_MIGRATION_VERSION, "0", "schema", []string{testSchema}).

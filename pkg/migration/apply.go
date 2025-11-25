@@ -67,6 +67,10 @@ func ApplyMigrations(ctx context.Context, pending []string, conn *pgx.Conn, fsys
 		if _, err := conn.Exec(ctx, "RESET ALL"); err != nil {
 			return errors.Errorf("failed to reset connection state: %v", err)
 		}
+		// Ensure extensions schema is in search_path so extension types (e.g., ltree) are accessible
+		if _, err := conn.Exec(ctx, `SET search_path = "$user", public, extensions`); err != nil {
+			return errors.Errorf("failed to set search_path: %v", err)
+		}
 		if migration, err := NewMigrationFromFile(path, fsys); err != nil {
 			return err
 		} else if err := migration.ExecBatch(ctx, conn); err != nil {
