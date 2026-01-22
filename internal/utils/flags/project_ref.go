@@ -22,7 +22,11 @@ func ParseProjectRef(ctx context.Context, fsys afero.Fs) error {
 	}
 	// Prompt as the last resort
 	if term.IsTerminal(int(os.Stdin.Fd())) {
-		return PromptProjectRef(ctx, "Select a project:")
+		opts := []tea.ProgramOption{}
+		if !term.IsTerminal(int(os.Stdout.Fd())) {
+			opts = append(opts, tea.WithOutput(os.Stderr))
+		}
+		return PromptProjectRef(ctx, "Select a project:", opts...)
 	}
 	return errors.New(utils.ErrNotLinked)
 }
