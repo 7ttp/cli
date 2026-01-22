@@ -9,3 +9,5 @@ The first time this command is run, a migration history table will be created un
 If you need to mutate the migration history table, such as deleting existing entries or inserting new entries without actually running the migration, use the `migration repair` command.
 
 Use the `--dry-run` flag to view the list of changes before applying.
+
+> Storage buckets defined in `config.toml` are not created by this command. Use `supabase seed buckets --linked` to create them on your remote project.
