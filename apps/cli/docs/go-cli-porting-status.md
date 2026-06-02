@@ -195,10 +195,10 @@ These route-first equivalents are intentionally lower-level than the old Go comm
 
 | Old command             | TS status | TS command path or `missing`     | Missing flags/params                    | Extra TS flags/params | Notes                                                                                                        |
 | ----------------------- | --------- | -------------------------------- | --------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `completion bash`       | `ported`  | `supabase completion bash`       | `-`                                     | `-`                   | Proxies verbatim to the Go binary so the emitted script is byte-identical to Cobra's output (CLI-1532).      |
-| `completion fish`       | `ported`  | `supabase completion fish`       | `-`                                     | `-`                   | Proxies verbatim to the Go binary so the emitted script is byte-identical to Cobra's output (CLI-1532).      |
-| `completion powershell` | `ported`  | `supabase completion powershell` | `-`                                     | `-`                   | Proxies verbatim to the Go binary so the emitted script is byte-identical to Cobra's output (CLI-1532).      |
-| `completion zsh`        | `ported`  | `supabase completion zsh`        | `-`                                     | `-`                   | Proxies verbatim to the Go binary so the emitted script is byte-identical to Cobra's output (CLI-1532).      |
+| `completion bash`       | `ported`  | `supabase completion bash`       | `-`                                     | `-`                   | Emits the Go-parity static shell script from TS while leaving runtime `__complete` on the legacy Go path.    |
+| `completion fish`       | `ported`  | `supabase completion fish`       | `-`                                     | `-`                   | Emits the Go-parity static shell script from TS while leaving runtime `__complete` on the legacy Go path.    |
+| `completion powershell` | `ported`  | `supabase completion powershell` | `-`                                     | `-`                   | Emits the Go-parity static shell script from TS while leaving runtime `__complete` on the legacy Go path.    |
+| `completion zsh`        | `ported`  | `supabase completion zsh`        | `-`                                     | `-`                   | Emits the Go-parity static shell script from TS while leaving runtime `__complete` on the legacy Go path.    |
 | `help`                  | `partial` | `supabase --help`                | Go-style top-level `help` command shape | `-`                   | Feature parity exists via the framework-provided global `--help` flag instead of a dedicated `help` command. |
 
 ## Legacy Shell Wrapping Status

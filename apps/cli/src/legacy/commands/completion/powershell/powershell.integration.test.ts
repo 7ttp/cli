@@ -1,25 +1,16 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer } from "effect";
-import { LegacyGoProxy } from "../../../../shared/legacy/go-proxy.service.ts";
+import { Effect } from "effect";
+import { mockOutput } from "../../../../../tests/helpers/mocks.ts";
+import { legacyCompletionPowershellScript } from "../completion.scripts.ts";
 import { legacyCompletionPowershell } from "./powershell.handler.ts";
 
-function setupLegacyCompletionPowershell() {
-  const calls: Array<ReadonlyArray<string>> = [];
-  const layer = Layer.succeed(LegacyGoProxy, {
-    exec: (args) =>
-      Effect.sync(() => {
-        calls.push(args);
-      }),
-  });
-  return { layer, calls };
-}
-
 describe("legacy completion powershell", () => {
-  it.live("forwards `completion powershell` to the Go binary", () => {
-    const { layer, calls } = setupLegacyCompletionPowershell();
+  it.live("prints the native powershell completion script", () => {
+    const out = mockOutput({ format: "text" });
     return Effect.gen(function* () {
       yield* legacyCompletionPowershell({});
-      expect(calls).toEqual([["completion", "powershell"]]);
-    }).pipe(Effect.provide(layer));
+      expect(out.stdoutText).toBe(legacyCompletionPowershellScript);
+      expect(out.stderrText).toBe("");
+    }).pipe(Effect.provide(out.layer));
   });
 });

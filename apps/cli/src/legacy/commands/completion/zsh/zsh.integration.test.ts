@@ -1,25 +1,16 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer } from "effect";
-import { LegacyGoProxy } from "../../../../shared/legacy/go-proxy.service.ts";
+import { Effect } from "effect";
+import { mockOutput } from "../../../../../tests/helpers/mocks.ts";
+import { legacyCompletionZshScript } from "../completion.scripts.ts";
 import { legacyCompletionZsh } from "./zsh.handler.ts";
 
-function setupLegacyCompletionZsh() {
-  const calls: Array<ReadonlyArray<string>> = [];
-  const layer = Layer.succeed(LegacyGoProxy, {
-    exec: (args) =>
-      Effect.sync(() => {
-        calls.push(args);
-      }),
-  });
-  return { layer, calls };
-}
-
 describe("legacy completion zsh", () => {
-  it.live("forwards `completion zsh` to the Go binary", () => {
-    const { layer, calls } = setupLegacyCompletionZsh();
+  it.live("prints the native zsh completion script", () => {
+    const out = mockOutput({ format: "text" });
     return Effect.gen(function* () {
       yield* legacyCompletionZsh({});
-      expect(calls).toEqual([["completion", "zsh"]]);
-    }).pipe(Effect.provide(layer));
+      expect(out.stdoutText).toBe(legacyCompletionZshScript);
+      expect(out.stderrText).toBe("");
+    }).pipe(Effect.provide(out.layer));
   });
 });

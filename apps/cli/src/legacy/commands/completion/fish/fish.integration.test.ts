@@ -1,25 +1,16 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer } from "effect";
-import { LegacyGoProxy } from "../../../../shared/legacy/go-proxy.service.ts";
+import { Effect } from "effect";
+import { mockOutput } from "../../../../../tests/helpers/mocks.ts";
+import { legacyCompletionFishScript } from "../completion.scripts.ts";
 import { legacyCompletionFish } from "./fish.handler.ts";
 
-function setupLegacyCompletionFish() {
-  const calls: Array<ReadonlyArray<string>> = [];
-  const layer = Layer.succeed(LegacyGoProxy, {
-    exec: (args) =>
-      Effect.sync(() => {
-        calls.push(args);
-      }),
-  });
-  return { layer, calls };
-}
-
 describe("legacy completion fish", () => {
-  it.live("forwards `completion fish` to the Go binary", () => {
-    const { layer, calls } = setupLegacyCompletionFish();
+  it.live("prints the native fish completion script", () => {
+    const out = mockOutput({ format: "text" });
     return Effect.gen(function* () {
       yield* legacyCompletionFish({});
-      expect(calls).toEqual([["completion", "fish"]]);
-    }).pipe(Effect.provide(layer));
+      expect(out.stdoutText).toBe(legacyCompletionFishScript);
+      expect(out.stderrText).toBe("");
+    }).pipe(Effect.provide(out.layer));
   });
 });
