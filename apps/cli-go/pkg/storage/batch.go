@@ -78,7 +78,16 @@ func (s *StorageAPI) UpsertObjects(ctx context.Context, bucketConfig config.Buck
 				return errors.New(err)
 			}
 			if !info.Type().IsRegular() {
-				return nil
+				if info.Type()&fs.ModeSymlink == 0 {
+					return nil
+				}
+				stat, err := fs.Stat(fsys, filePath)
+				if err != nil {
+					return errors.Errorf("failed to stat file: %w", err)
+				}
+				if !stat.Mode().IsRegular() {
+					return nil
+				}
 			}
 			dstPath := uo.KeyPrefix
 			relPath, err := filepath.Rel(localPath, filePath)

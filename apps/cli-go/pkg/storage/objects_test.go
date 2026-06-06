@@ -2,19 +2,49 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
+	"io/fs"
 	"mime"
 	"net/http"
+	"path"
 	"testing"
-	fs "testing/fstest"
+	fstest "testing/fstest"
 
 	"github.com/h2non/gock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/supabase/cli/pkg/config"
 	"github.com/supabase/cli/pkg/fetcher"
 )
 
 var mockApi = StorageAPI{Fetcher: fetcher.NewFetcher(
 	"http://127.0.0.1",
 )}
+
+type mapSymlinkFS struct {
+	base fstest.MapFS
+}
+
+func (m mapSymlinkFS) Open(name string) (fs.File, error) {
+	return m.base.Open(m.resolve(name))
+}
+
+func (m mapSymlinkFS) Stat(name string) (fs.FileInfo, error) {
+	return fs.Stat(m.base, m.resolve(name))
+}
+
+func (m mapSymlinkFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	return fs.ReadDir(m.base, path.Clean(name))
+}
+
+func (m mapSymlinkFS) resolve(name string) string {
+	clean := path.Clean(name)
+	if file, ok := m.base[clean]; ok && file.Mode&fs.ModeSymlink != 0 {
+		target := path.Clean(path.Join(path.Dir(clean), string(file.Data)))
+		return m.resolve(target)
+	}
+	return clean
+}
 
 func TestParseFileOptionsContentTypeDetection(t *testing.T) {
 	tests := []struct {
@@ -73,7 +103,7 @@ func TestParseFileOptionsContentTypeDetection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create a temporary file with test content
-			fsys := fs.MapFS{tt.filename: &fs.MapFile{Data: tt.content}}
+			fsys := fstest.MapFS{tt.filename: &fstest.MapFile{Data: tt.content}}
 			// Setup mock api
 			defer gock.OffAll()
 			gock.New("http://127.0.0.1").
@@ -89,4 +119,33 @@ func TestParseFileOptionsContentTypeDetection(t *testing.T) {
 			assert.Empty(t, gock.GetUnmatchedRequests())
 		})
 	}
+}
+
+func TestUpsertObjectsUploadsSymlinkedFiles(t *testing.T) {
+	fsys := mapSymlinkFS{
+		base: fstest.MapFS{
+			"uploads":           {Mode: fs.ModeDir},
+			"uploads/pizza.jpg": {Mode: fs.ModeSymlink, Data: []byte("../fixtures/pizza.jpg")},
+			"fixtures":          {Mode: fs.ModeDir},
+			"fixtures/pizza.jpg": {
+				Data: []byte("pizza"),
+			},
+		},
+	}
+
+	var bucketConfig config.BucketConfig
+	require.NoError(
+		t,
+		json.Unmarshal([]byte(`{"uploads":{"objects_path":"uploads"}}`), &bucketConfig),
+	)
+
+	defer gock.OffAll()
+	gock.New("http://127.0.0.1").
+		Post("/storage/v1/object/uploads/pizza.jpg").
+		Reply(http.StatusOK)
+
+	err := mockApi.UpsertObjects(context.Background(), bucketConfig, fsys)
+	require.NoError(t, err)
+	assert.Empty(t, gock.Pending())
+	assert.Empty(t, gock.GetUnmatchedRequests())
 }
