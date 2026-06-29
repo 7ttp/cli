@@ -325,6 +325,26 @@ async function realpathIfExists(pathname: string) {
   }
 }
 
+async function appendNearestPackageJsonWithinRoots(
+  roots: ReadonlyArray<string>,
+  pathname: string,
+  onFile: (pathname: string, contents: Uint8Array) => Promise<void>,
+) {
+  let current = dirname(await realpath(pathname));
+  while (isContainedInAnyPath(roots, current)) {
+    const candidate = join(current, "package.json");
+    if (await isFile(candidate)) {
+      await onFile(candidate, new Uint8Array());
+      return;
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      return;
+    }
+    current = parent;
+  }
+}
+
 function humanSize(bytes: number) {
   if (bytes < 1000) {
     return `${bytes} B`;
@@ -568,6 +588,19 @@ async function loadImportMapFile(
     return loadImportMapFile(nestedPath, onRead, seen);
   }
   return importMap;
+}
+
+export async function loadResolvedImportMap(pathname: string) {
+  const importMap = await loadImportMapFile(pathname);
+  return {
+    imports: { ...importMap.imports },
+    scopes: Object.fromEntries(
+      Object.entries(importMap.scopes).map(([scopeName, scopeValue]) => [
+        scopeName,
+        { ...scopeValue },
+      ]),
+    ),
+  };
 }
 
 function substituteImportMapValue(
@@ -1093,6 +1126,7 @@ export async function buildDockerBinds(
     readonly additionalModuleRoots?: ReadonlyArray<string>;
     readonly onWarning?: (message: string) => Promise<void>;
     readonly skipMissingImportMapTargets?: boolean;
+    readonly includeNearestPackageJson?: boolean;
   } = {},
 ) {
   const hostFunctionsDir = resolve(functionsDir);
@@ -1133,10 +1167,26 @@ export async function buildDockerBinds(
   };
   const appendProjectBind = async (pathname: string, _contents: Uint8Array) =>
     appendBindWithinRoots([realProjectRoot], pathname);
-  const appendModuleBind = async (pathname: string, _contents: Uint8Array) =>
-    appendBindWithinRoots(moduleRoots, pathname);
-  const appendImportMapBind = async (pathname: string, _contents: Uint8Array) =>
-    appendBindWithinRoots(importMapAllowedRoots, pathname);
+  const appendModuleBind = async (pathname: string, _contents: Uint8Array) => {
+    await appendBindWithinRoots(moduleRoots, pathname);
+    if (options.includeNearestPackageJson === true) {
+      await appendNearestPackageJsonWithinRoots(
+        moduleRoots,
+        pathname,
+        appendBindWithinRoots.bind(null, moduleRoots),
+      );
+    }
+  };
+  const appendImportMapBind = async (pathname: string, _contents: Uint8Array) => {
+    await appendBindWithinRoots(importMapAllowedRoots, pathname);
+    if (options.includeNearestPackageJson === true) {
+      await appendNearestPackageJsonWithinRoots(
+        importMapAllowedRoots,
+        pathname,
+        appendBindWithinRoots.bind(null, importMapAllowedRoots),
+      );
+    }
+  };
   const importMap =
     config.importMap.length > 0
       ? await loadImportMapFile(config.importMap, appendImportMapBind)

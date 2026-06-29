@@ -53,6 +53,7 @@ interface FunctionConfig {
   staticFiles: string[];
   verifyJWT: boolean;
   env?: Record<string, string>;
+  useNpm?: boolean;
 }
 
 function getResponse(payload: any, status: number, customHeaders = {}) {
@@ -184,25 +185,6 @@ export async function verifyHybridJWT(
   return false;
 }
 
-// Ref: https://docs.deno.com/examples/checking_file_existence/
-async function shouldUsePackageJsonDiscovery({
-  entrypointPath,
-  importMapPath,
-}: FunctionConfig): Promise<boolean> {
-  if (importMapPath) {
-    return false;
-  }
-  const packageJsonPath = join(dirname(entrypointPath), "package.json");
-  try {
-    await Deno.lstat(packageJsonPath);
-  } catch (err) {
-    if (err instanceof Deno.errors.NotFound) {
-      return false;
-    }
-  }
-  return true;
-}
-
 export function prepareUserRequest(req: Request): Request {
   const clonedURL = new URL(req.url);
   const forwardedHost = req.headers.get("x-forwarded-host");
@@ -296,7 +278,7 @@ Deno.serve({
 
     const absEntrypoint = join(Deno.cwd(), functionsConfig[functionName].entrypointPath);
     const maybeEntrypoint = toFileUrl(absEntrypoint).href;
-    const usePackageJson = await shouldUsePackageJsonDiscovery(functionsConfig[functionName]);
+    const usePackageJson = functionsConfig[functionName].useNpm === true;
 
     const staticPatterns = functionsConfig[functionName].staticFiles;
 

@@ -42,6 +42,7 @@ import {
   ensureDockerNamedVolume,
   ensureDockerNetwork,
   isDockerRunning,
+  loadResolvedImportMap,
   localDockerId,
   normalizeProjectId,
   rawFunctionConfigRecord,
@@ -163,6 +164,7 @@ interface ServeFunctionContainerConfig {
   readonly importMapPath?: string;
   readonly staticFiles?: ReadonlyArray<string>;
   readonly env?: Readonly<Record<string, string>>;
+  readonly useNpm?: boolean;
 }
 
 interface WatchSpec {
@@ -174,6 +176,12 @@ interface StartedRuntime {
   readonly containerId: string;
   readonly cleanup: Effect.Effect<void>;
   readonly watchSpecs: ReadonlyArray<WatchSpec>;
+}
+
+interface GeneratedServeImportMap {
+  readonly bind: string;
+  readonly cleanup: () => Promise<void>;
+  readonly containerPath: string;
 }
 
 type SigningKeyJwk = JsonWebKeyInput["key"] & {
@@ -779,6 +787,8 @@ const parseCustomEnvFile = Effect.fnUntraced(function* (
 function toFunctionContainerConfig(
   workdir: string,
   config: ResolvedDeployFunctionConfig,
+  useNpm: boolean,
+  importMapPathOverride?: string,
 ): ServeFunctionContainerConfig {
   const toContainerPath = (pathname: string) => {
     const resolvedPath = resolve(pathname);
@@ -792,12 +802,106 @@ function toFunctionContainerConfig(
     // unlike deploy which omits it. Mirror that default here.
     verifyJWT: config.verifyJwt ?? true,
     entrypointPath: toContainerPath(config.entrypoint),
-    ...(config.importMap.length === 0 ? {} : { importMapPath: toContainerPath(config.importMap) }),
+    ...(importMapPathOverride !== undefined
+      ? { importMapPath: importMapPathOverride }
+      : config.importMap.length === 0
+        ? {}
+        : { importMapPath: toContainerPath(config.importMap) }),
     ...(config.staticFiles.length === 0
       ? {}
       : { staticFiles: config.staticFiles.map((pathname) => toContainerPath(pathname)) }),
     ...(Object.keys(config.env).length === 0 ? {} : { env: config.env }),
+    ...(useNpm ? { useNpm: true } : {}),
   };
+}
+
+async function shouldUseNpm(binds: ReadonlyArray<string>, config: ResolvedDeployFunctionConfig) {
+  try {
+    const packageJson = await stat(join(dirname(config.entrypoint), "package.json"));
+    if (packageJson.isFile()) {
+      return true;
+    }
+  } catch {}
+
+  return binds.some((bind) => basename(dockerBindHostPath(bind)) === "package.json");
+}
+
+function readPackageJsonDependencyMapField(value: unknown) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return [];
+  }
+  return Object.entries(value).flatMap(([name, version]) =>
+    typeof version === "string" ? [[name, version] as const] : [],
+  );
+}
+
+async function buildWorkspacePackageDependencyImports(packageJsonPaths: ReadonlyArray<string>) {
+  const imports: Record<string, string> = {};
+  for (const packageJsonPath of new Set(packageJsonPaths)) {
+    const parsed = JSON.parse(await readFile(packageJsonPath, "utf8")) as Record<string, unknown>;
+    for (const [name, version] of [
+      ...readPackageJsonDependencyMapField(parsed["dependencies"]),
+      ...readPackageJsonDependencyMapField(parsed["peerDependencies"]),
+      ...readPackageJsonDependencyMapField(parsed["optionalDependencies"]),
+    ]) {
+      imports[name] ??= `npm:${name}@${version}`;
+    }
+  }
+  return imports;
+}
+
+async function writeGeneratedServeImportMap(
+  slug: string,
+  importMap: {
+    readonly imports: Readonly<Record<string, string>>;
+    readonly scopes: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  },
+): Promise<GeneratedServeImportMap> {
+  const dir = await mkdtemp(join(tmpdir(), "supabase-functions-serve-import-map-"));
+  const pathname = join(dir, `${slug}.json`);
+  await writeFile(pathname, JSON.stringify(importMap));
+  const containerPath = `/root/.supabase/import-maps/${slug}.json`;
+  return {
+    bind: `${pathname}:${containerPath}:ro`,
+    cleanup: () => rm(dir, { recursive: true, force: true }),
+    containerPath,
+  };
+}
+
+async function prepareServeImportMap(
+  config: ResolvedDeployFunctionConfig,
+  functionDockerBinds: ReadonlyArray<string>,
+) {
+  const packageJsonPaths = functionDockerBinds
+    .map(dockerBindHostPath)
+    .filter((pathname) => basename(pathname) === "package.json");
+  if (packageJsonPaths.length === 0) {
+    return undefined;
+  }
+
+  const dependencyImports = await buildWorkspacePackageDependencyImports(packageJsonPaths);
+  if (Object.keys(dependencyImports).length === 0) {
+    return undefined;
+  }
+
+  const baseImportMap =
+    config.importMap.length === 0
+      ? { imports: {}, scopes: {} }
+      : await loadResolvedImportMap(config.importMap);
+
+  let changed = false;
+  for (const [name, target] of Object.entries(dependencyImports)) {
+    if (baseImportMap.imports[name] !== undefined) {
+      continue;
+    }
+    baseImportMap.imports[name] = target;
+    changed = true;
+  }
+  if (!changed) {
+    return undefined;
+  }
+
+  return writeGeneratedServeImportMap(config.slug, baseImportMap);
 }
 
 function splitEnvEntry(entry: string) {
@@ -1333,6 +1437,7 @@ const startEdgeRuntime = Effect.fnUntraced(function* (input: {
     const functionsDir = join(input.dependencies.projectRoot, functionsDirName);
     const functionBinds = new Set<string>();
     const functionsConfig: Record<string, ServeFunctionContainerConfig> = {};
+    const generatedImportMaps: GeneratedServeImportMap[] = [];
 
     for (const config of functionConfigs) {
       if (!config.enabled) {
@@ -1341,16 +1446,27 @@ const startEdgeRuntime = Effect.fnUntraced(function* (input: {
       }
 
       const bindWarnings: string[] = [];
-      for (const bind of yield* Effect.promise(() =>
+      const functionDockerBinds = yield* Effect.promise(() =>
         buildDockerBinds(projectId, functionsDir, functionsDir, config, {
           additionalModuleRoots: [input.dependencies.flagCwd],
+          includeNearestPackageJson: true,
           skipMissingImportMapTargets: true,
           onWarning: async (message) => {
             bindWarnings.push(message);
           },
         }),
-      )) {
+      );
+      for (const bind of functionDockerBinds) {
         functionBinds.add(bind);
+      }
+      const generatedImportMap = yield* Effect.tryPromise(() =>
+        prepareServeImportMap(config, functionDockerBinds),
+      ).pipe(
+        Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))),
+      );
+      if (generatedImportMap !== undefined) {
+        functionBinds.add(generatedImportMap.bind);
+        generatedImportMaps.push(generatedImportMap);
       }
       const missingSourceWarning = bindWarnings.find((warning) =>
         warning.includes("failed to read file:"),
@@ -1363,6 +1479,8 @@ const startEdgeRuntime = Effect.fnUntraced(function* (input: {
       functionsConfig[config.slug] = toFunctionContainerConfig(
         input.dependencies.projectRoot,
         config,
+        yield* Effect.promise(() => shouldUseNpm(functionDockerBinds, config)),
+        generatedImportMap?.containerPath,
       );
     }
 
@@ -1456,6 +1574,9 @@ const startEdgeRuntime = Effect.fnUntraced(function* (input: {
     ];
 
     const cleanupRuntimeArtifacts = Effect.all([
+      Effect.forEach(generatedImportMaps, (generatedImportMap) =>
+        Effect.tryPromise(() => generatedImportMap.cleanup()).pipe(Effect.orDie),
+      ).pipe(Effect.asVoid),
       Effect.tryPromise(() => serveMainTemplateFile.cleanup()).pipe(Effect.orDie),
       dockerEnvFile === undefined
         ? Effect.void

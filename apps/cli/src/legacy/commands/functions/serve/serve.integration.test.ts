@@ -516,6 +516,7 @@ describe("legacy functions serve integration", () => {
         ]);
       });
     },
+    10_000,
   );
 
   it.live("mounts multiline env values without placing their contents in docker argv", () => {
@@ -858,6 +859,140 @@ describe("legacy functions serve integration", () => {
       ).toBe(true);
     });
   });
+
+  it.live(
+    "mounts workspace package manifests and enables npm discovery for workspace imports",
+    () => {
+      let generatedImportMapContents: string | undefined;
+      deployMockState.runHandler = (command, args) => {
+        if (command !== "docker") {
+          throw new Error(`unexpected process: ${command}`);
+        }
+        if (args[0] === "container" && args[1] === "inspect") {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (args[0] === "container" && args[1] === "rm") {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (args[0] === "run") {
+          const generatedImportMapHostPath = extractFlagValues(args, "-v")
+            .find((value) => value.endsWith(":/root/.supabase/import-maps/hello.json:ro"))
+            ?.slice(0, -":/root/.supabase/import-maps/hello.json:ro".length);
+          if (generatedImportMapHostPath !== undefined) {
+            generatedImportMapContents = readFileSync(generatedImportMapHostPath, "utf8");
+          }
+          return { exitCode: 0, stdout: "edge-runtime-id\n", stderr: "" };
+        }
+        if (args[0] === "exec") {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        throw new Error(`unexpected docker args: ${args.join(" ")}`);
+      };
+
+      const childSpawner = mockDockerLogSpawner([{ exitCode: 1, stderr: "serve logs failed" }]);
+
+      return Effect.gen(function* () {
+        yield* Effect.promise(() =>
+          writeProjectConfig(['project_id = "test-project"', ""].join("\n")),
+        );
+        yield* Effect.promise(() =>
+          writeFunctionFile(
+            "hello",
+            "index.ts",
+            [
+              'export { message } from "../../../libs/core/dist/index.ts";',
+              "Deno.serve(() => new Response(message));",
+              "",
+            ].join("\n"),
+          ),
+        );
+        yield* Effect.promise(() => writeFunctionFile("hello", "deno.json", '{"imports":{}}\n'));
+        yield* Effect.promise(() =>
+          writeProjectFile(
+            "libs/core/package.json",
+            JSON.stringify({
+              name: "@repo/core",
+              dependencies: {
+                axios: "^1.7.0",
+              },
+            }),
+          ),
+        );
+        yield* Effect.promise(() =>
+          writeProjectFile(
+            "libs/core/dist/index.ts",
+            ['export const message = "hello from workspace";', ""].join("\n"),
+          ),
+        );
+
+        const { layer } = setupServe({ childSpawner });
+        const error = yield* legacyFunctionsServe(baseFlags()).pipe(
+          Effect.provide(layer),
+          Effect.flip,
+        );
+
+        expect(error).toBeInstanceOf(Error);
+        if (error instanceof Error) {
+          expect(error.message).toContain("serve logs failed");
+        }
+
+        const dockerRun = deployMockState.runCalls.find(
+          (call) => call.command === "docker" && call.args[0] === "run",
+        );
+        expect(dockerRun).toBeDefined();
+        if (dockerRun === undefined) {
+          throw new Error("expected docker run invocation");
+        }
+
+        const resolvedWorkspacePackageJsonPath = realpathSync(
+          join(tempRoot.current, "libs", "core", "package.json"),
+        );
+        expect(
+          extractFlagValues(dockerRun.args, "-v").some(
+            (value) =>
+              value.startsWith(`${resolvedWorkspacePackageJsonPath}:`) &&
+              value.endsWith("/libs/core/package.json:ro"),
+          ),
+        ).toBe(true);
+        expect(
+          extractFlagValues(dockerRun.args, "-v").some((value) =>
+            value.endsWith(":/root/.supabase/import-maps/hello.json:ro"),
+          ),
+        ).toBe(true);
+        expect(generatedImportMapContents).toBeDefined();
+        if (generatedImportMapContents === undefined) {
+          throw new Error("expected generated import map contents");
+        }
+        expect(JSON.parse(generatedImportMapContents)).toEqual(
+          expect.objectContaining({
+            imports: expect.objectContaining({
+              axios: "npm:axios@^1.7.0",
+            }),
+          }),
+        );
+
+        const envs = yield* Effect.promise(() => extractDockerEnvEntries(dockerRun));
+        const functionsConfig = envs.find((entry) =>
+          entry.startsWith("SUPABASE_INTERNAL_FUNCTIONS_CONFIG="),
+        );
+        expect(functionsConfig).toBeDefined();
+        if (functionsConfig === undefined) {
+          throw new Error("missing SUPABASE_INTERNAL_FUNCTIONS_CONFIG");
+        }
+
+        expect(
+          JSON.parse(functionsConfig.slice("SUPABASE_INTERNAL_FUNCTIONS_CONFIG=".length)),
+        ).toEqual(
+          expect.objectContaining({
+            hello: expect.objectContaining({
+              importMapPath: "/root/.supabase/import-maps/hello.json",
+              useNpm: true,
+            }),
+          }),
+        );
+      });
+    },
+  );
 
   it.live("restarts the runtime when watched files change", () => {
     deployMockState.runHandler = (command, args) => {
