@@ -191,6 +191,9 @@ func ResolvePoolerConfigForFallback(ctx context.Context, projectRef string) (pgc
 		}
 		// Supavisor transaction mode does not support prepared statements.
 		poolerConfig.Port = 5432
+		for _, fallback := range poolerConfig.Fallbacks {
+			fallback.Port = poolerConfig.Port
+		}
 	}
 	if password := viper.GetString("DB_PASSWORD"); len(password) > 0 {
 		poolerConfig.Password = password

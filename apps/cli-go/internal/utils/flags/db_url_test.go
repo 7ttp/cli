@@ -92,6 +92,7 @@ func TestResolvePoolerConfigForFallback(t *testing.T) {
 	ref := apitest.RandomProjectRef()
 
 	t.Run("uses linked pooler url with db password", func(t *testing.T) {
+		t.Setenv("PGSSLMODE", "allow")
 		utils.Config.Db.Pooler.ConnectionString = "postgres://postgres." + ref + ":[YOUR-PASSWORD]@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
 		viper.Set("DB_PASSWORD", "secret")
 		t.Cleanup(func() {
@@ -104,11 +105,14 @@ func TestResolvePoolerConfigForFallback(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "aws-0-us-east-1.pooler.supabase.com", config.Host)
 		assert.Equal(t, uint16(5432), config.Port)
+		require.Len(t, config.Fallbacks, 1)
+		assert.Equal(t, config.Port, config.Fallbacks[0].Port)
 		assert.Equal(t, "postgres."+ref, config.User)
 		assert.Equal(t, "secret", config.Password)
 	})
 
 	t.Run("falls back to api pooler config", func(t *testing.T) {
+		t.Setenv("PGSSLMODE", "allow")
 		poolerURL := "postgres://postgres." + ref + ":[YOUR-PASSWORD]@aws-0-eu-west-1.pooler.supabase.com:6543/postgres"
 		utils.Config.Db.Pooler.ConnectionString = ""
 		viper.Set("DB_PASSWORD", "secret")
@@ -127,6 +131,8 @@ func TestResolvePoolerConfigForFallback(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "aws-0-eu-west-1.pooler.supabase.com", config.Host)
 		assert.Equal(t, uint16(5432), config.Port)
+		require.Len(t, config.Fallbacks, 1)
+		assert.Equal(t, config.Port, config.Fallbacks[0].Port)
 		assert.Equal(t, "secret", config.Password)
 		assert.Empty(t, apitest.ListUnmatchedRequests())
 	})

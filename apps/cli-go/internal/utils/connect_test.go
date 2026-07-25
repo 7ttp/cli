@@ -11,6 +11,7 @@ import (
 	"github.com/go-errors/errors"
 	"github.com/h2non/gock"
 	"github.com/jackc/pgconn"
+	"github.com/jackc/pgx/v4"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -116,6 +117,86 @@ func TestConnectByConfig(t *testing.T) {
 		// Check error
 		require.ErrorIs(t, err, netErr)
 		assert.Empty(t, apitest.ListUnmatchedRequests())
+	})
+}
+
+func TestConnectByConfigPreservesSSLMode(t *testing.T) {
+	DNSResolver.Value = DNS_GO_NATIVE
+	viper.Set("DEBUG", false)
+
+	captureConfig := func(t *testing.T, config pgconn.Config) *pgx.ConnConfig {
+		t.Helper()
+		conn := pgtest.NewConn()
+		defer conn.Close(t)
+		var captured *pgx.ConnConfig
+		c, err := ConnectByConfig(context.Background(), config, func(cc *pgx.ConnConfig) {
+			captured = cc.Copy()
+			cc.ValidateConnect = nil
+		}, conn.Intercept)
+		require.NoError(t, err)
+		defer c.Close(context.Background())
+		require.NotNil(t, captured)
+		return captured
+	}
+
+	for _, tc := range []struct {
+		name        string
+		urlMode     string
+		envMode     string
+		expectedTLS bool
+	}{
+		{name: "require overrides ambient disable", urlMode: "require", envMode: "disable", expectedTLS: true},
+		{name: "require overrides invalid ambient mode", urlMode: "require", envMode: "invalid", expectedTLS: true},
+		{name: "disable overrides ambient require", urlMode: "disable", envMode: "require", expectedTLS: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PGSSLMODE", tc.envMode)
+			config, err := pgconn.ParseConfig("postgresql://postgres:password@db.example.com:5432/postgres?sslmode=" + tc.urlMode)
+			require.NoError(t, err)
+			captured := captureConfig(t, *config)
+			assert.Equal(t, tc.expectedTLS, captured.TLSConfig != nil)
+		})
+	}
+
+	t.Run("retains verify-full certificate verification", func(t *testing.T) {
+		t.Setenv("PGSSLMODE", "disable")
+		config, err := pgconn.ParseConfig("postgresql://postgres:password@db.example.com:5432/postgres?sslmode=verify-full")
+		require.NoError(t, err)
+		captured := captureConfig(t, *config)
+		require.NotNil(t, captured.TLSConfig)
+		assert.False(t, captured.TLSConfig.InsecureSkipVerify)
+		assert.Equal(t, "db.example.com", captured.TLSConfig.ServerName)
+		assert.Empty(t, captured.Fallbacks)
+	})
+
+	t.Run("retains allow TLS fallback", func(t *testing.T) {
+		t.Setenv("PGSSLMODE", "require")
+		config, err := pgconn.ParseConfig("postgresql://postgres:password@db.example.com:5432/postgres?sslmode=allow")
+		require.NoError(t, err)
+		captured := captureConfig(t, *config)
+		assert.Nil(t, captured.TLSConfig)
+		require.Len(t, captured.Fallbacks, 1)
+		assert.NotNil(t, captured.Fallbacks[0].TLSConfig)
+	})
+
+	t.Run("retains fallback host validation", func(t *testing.T) {
+		config, err := pgconn.ParseConfig("postgresql://postgres:password@db1.example.com:5432,db2.example.com:5432/postgres?sslmode=require&target_session_attrs=primary")
+		require.NoError(t, err)
+		captured := captureConfig(t, *config)
+		require.Len(t, captured.Fallbacks, 1)
+		assert.NotNil(t, captured.ValidateConnect)
+	})
+
+	t.Run("retains default TLS for generated remote config", func(t *testing.T) {
+		t.Setenv("PGSSLMODE", "require")
+		captured := captureConfig(t, pgconn.Config{
+			Host:     "db.example.com",
+			Port:     5432,
+			User:     "postgres",
+			Password: "password",
+			Database: "postgres",
+		})
+		assert.NotNil(t, captured.TLSConfig)
 	})
 }
 

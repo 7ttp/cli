@@ -114,6 +114,9 @@ func GetPoolerConfig(projectRef string) *pgconn.Config {
 	fmt.Fprintln(logger, "Using connection pooler:", Config.Db.Pooler.ConnectionString)
 	// Supavisor transaction mode does not support prepared statement
 	poolerConfig.Port = 5432
+	for _, fallback := range poolerConfig.Fallbacks {
+		fallback.Port = poolerConfig.Port
+	}
 	return poolerConfig
 }
 
@@ -346,7 +349,19 @@ func ConnectByConfigStream(ctx context.Context, config pgconn.Config, w io.Write
 		return ConnectLocalPostgres(ctx, config, options...)
 	}
 	fmt.Fprintln(w, "Connecting to remote database...")
-	opts := append(options, func(cc *pgx.ConnConfig) {
+	opts := make([]func(*pgx.ConnConfig), 0, len(options)+2)
+	connURL := ToPostgresURL(config)
+	if config.TLSConfig != nil || config.Fallbacks != nil {
+		parsed := config.Copy()
+		connURL += "&sslmode=disable"
+		opts = append(opts, func(cc *pgx.ConnConfig) {
+			cc.TLSConfig = parsed.TLSConfig
+			cc.Fallbacks = parsed.Fallbacks
+			cc.ValidateConnect = parsed.ValidateConnect
+		})
+	}
+	opts = append(opts, options...)
+	opts = append(opts, func(cc *pgx.ConnConfig) {
 		if DNSResolver.Value == DNS_OVER_HTTPS {
 			cc.LookupFunc = FallbackLookupIP
 		}
@@ -358,7 +373,7 @@ func ConnectByConfigStream(ctx context.Context, config pgconn.Config, w io.Write
 			}
 		}
 	})
-	return ConnectByUrl(ctx, ToPostgresURL(config), opts...)
+	return ConnectByUrl(ctx, connURL, opts...)
 }
 
 func ConnectByConfig(ctx context.Context, config pgconn.Config, options ...func(*pgx.ConnConfig)) (*pgx.Conn, error) {
