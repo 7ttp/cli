@@ -2013,7 +2013,13 @@ export const legacyStart = Effect.fn("legacy.start")(function* (flags: LegacySta
       const postgresHealthResult = yield* legacyWaitForHealthyServices(
         spawner,
         [postgresContainerId],
-        { timeoutSeconds: dbHealthTimeoutSeconds },
+        {
+          timeoutSeconds: dbHealthTimeoutSeconds,
+          recovery: {
+            workdir: cliConfig.workdir,
+            platform: runtimeInfo.platform,
+          },
+        },
       ).pipe(Effect.result);
       if (Result.isFailure(postgresHealthResult)) {
         const error = postgresHealthResult.failure;
@@ -2476,6 +2482,11 @@ export const legacyStart = Effect.fn("legacy.start")(function* (flags: LegacySta
         const healthResult = yield* legacyWaitForHealthyServices(spawner, started, {
           postgrest: postgrestGateway,
           edgeRuntime: edgeRuntimeGateway,
+          recovery: {
+            workdir: cliConfig.workdir,
+            platform: runtimeInfo.platform,
+            storageContainerId,
+          },
         }).pipe(
           Effect.result,
           localKongCa !== undefined
@@ -2499,9 +2510,17 @@ export const legacyStart = Effect.fn("legacy.start")(function* (flags: LegacySta
             // the same downgrade-to-warning as every other ignored-unhealthy
             // failure.
             if (isFreshVolume && storageContainerId !== undefined) {
-              const storageHealthResult = yield* legacyWaitForHealthyServices(spawner, [
-                storageContainerId,
-              ]).pipe(Effect.result);
+              const storageHealthResult = yield* legacyWaitForHealthyServices(
+                spawner,
+                [storageContainerId],
+                {
+                  recovery: {
+                    workdir: cliConfig.workdir,
+                    platform: runtimeInfo.platform,
+                    storageContainerId,
+                  },
+                },
+              ).pipe(Effect.result);
               if (Result.isSuccess(storageHealthResult)) {
                 const seedResult = yield* legacySeedBucketsRun({
                   projectRef: "",

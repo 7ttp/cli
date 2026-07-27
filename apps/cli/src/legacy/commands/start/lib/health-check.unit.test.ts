@@ -18,7 +18,13 @@ import {
  * health across successive polling rounds. `docker logs` calls (the
  * timeout-path debug dump) always succeed with empty output.
  */
-function mockHealthSpawner(inspectResponse: (containerId: string, callIndex: number) => string) {
+function mockHealthSpawner(
+  inspectResponse: (containerId: string, callIndex: number) => string,
+  opts: {
+    readonly logs?: Readonly<Record<string, string | ReadonlyArray<string>>>;
+    readonly images?: Readonly<Record<string, string>>;
+  } = {},
+) {
   const counts = new Map<string, number>();
   const encoder = new TextEncoder();
   const spawned: Array<ReadonlyArray<string>> = [];
@@ -28,19 +34,25 @@ function mockHealthSpawner(inspectResponse: (containerId: string, callIndex: num
       const args = command._tag === "StandardCommand" ? command.args : [];
       spawned.push(args);
 
-      let stdout = "";
-      if (args[0] === "container" && args[1] === "inspect") {
+      let stdout: ReadonlyArray<string> = [];
+      if (args[0] === "container" && args[1] === "inspect" && args[4] === "{{.Config.Image}}") {
+        const image = opts.images?.[args[2] ?? ""];
+        stdout = image === undefined ? [] : [image];
+      } else if (args[0] === "container" && args[1] === "inspect") {
         const containerId = args[2] ?? "";
         const callIndex = counts.get(containerId) ?? 0;
         counts.set(containerId, callIndex + 1);
-        stdout = inspectResponse(containerId, callIndex);
+        stdout = [inspectResponse(containerId, callIndex)];
+      } else if (args[0] === "logs") {
+        const logs = opts.logs?.[args[1] ?? ""];
+        stdout = logs === undefined ? [] : typeof logs === "string" ? [logs] : logs;
       }
 
       const exitDeferred = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
       yield* Deferred.succeed(exitDeferred, ChildProcessSpawner.ExitCode(0));
       return ChildProcessSpawner.makeHandle({
         pid: ChildProcessSpawner.ProcessId(1),
-        stdout: Stream.fromIterable(stdout.length > 0 ? [encoder.encode(stdout)] : []),
+        stdout: Stream.fromIterable(stdout.map((chunk) => encoder.encode(chunk))),
         stderr: Stream.empty,
         all: Stream.empty,
         exitCode: Deferred.await(exitDeferred),
@@ -202,6 +214,202 @@ describe("legacyWaitForHealthyServices", () => {
       expect(
         mock.spawned.some((args) => args[0] === "logs" && args[1] === "supabase_rest_proj"),
       ).toBe(true);
+    }),
+  );
+
+  it.effect(
+    "suggests removing the exact cached image after an exec-format failure without deleting local data",
+    () =>
+      Effect.gen(function* () {
+        const containerId = "supabase_inbucket_proj";
+        const image = "public.ecr.aws/supabase/mailpit:v1.30.2";
+        const mock = mockHealthSpawner(() => notRunning, {
+          logs: { [containerId]: ["exec /mailpit: exec for", "mat error\n"] },
+          images: { [containerId]: image },
+        });
+
+        const fiber = yield* legacyWaitForHealthyServices(mock.spawner, [containerId], {
+          timeoutSeconds: 1,
+          recovery: {
+            workdir: "/tmp/project with spaces",
+            platform: "linux",
+          },
+        }).pipe(
+          Effect.provide(unusedHttpClientLayer),
+          Effect.forkChild({ startImmediately: true }),
+        );
+
+        yield* TestClock.adjust("1 seconds");
+        const error = yield* Fiber.join(fiber).pipe(Effect.flip);
+
+        expect(error.message).toContain("cached Docker image");
+        expect(error.message).toContain("supabase --workdir '/tmp/project with spaces' stop");
+        expect(error.message).toContain(`docker image rm ${image}`);
+        expect(error.message).toContain("supabase --workdir '/tmp/project with spaces' start");
+        expect(error.message).not.toContain("stop --no-backup");
+      }),
+  );
+
+  it.effect(
+    "warns before suggesting a local-data reset for conflicting Storage migration state",
+    () =>
+      Effect.gen(function* () {
+        const containerId = "supabase_storage_proj";
+        const mock = mockHealthSpawner(() => runningStarting, {
+          logs: {
+            [containerId]:
+              'Migration failed. Reason: duplicate key value violates unique constraint "migrations_name_key"\n',
+          },
+        });
+
+        const fiber = yield* legacyWaitForHealthyServices(mock.spawner, [containerId], {
+          timeoutSeconds: 1,
+          recovery: {
+            workdir: String.raw`C:\project files`,
+            platform: "win32",
+            storageContainerId: containerId,
+          },
+        }).pipe(
+          Effect.provide(unusedHttpClientLayer),
+          Effect.forkChild({ startImmediately: true }),
+        );
+
+        yield* TestClock.adjust("1 seconds");
+        const error = yield* Fiber.join(fiber).pipe(Effect.flip);
+
+        expect(error.message).toContain("Storage migration state");
+        expect(error.message).toContain("deletes local database data");
+        expect(error.message).toContain(
+          String.raw`supabase --workdir "C:\project files" stop --no-backup`,
+        );
+        expect(error.message).toContain(String.raw`supabase --workdir "C:\project files" start`);
+      }),
+  );
+
+  it.effect("does not suggest deleting data for incomplete or non-Storage migration errors", () =>
+    Effect.gen(function* () {
+      const storageId = "supabase_storage_proj";
+      const restId = "supabase_rest_proj";
+      const mock = mockHealthSpawner(() => runningStarting, {
+        logs: {
+          [storageId]: 'constraint "migrations_name_key" already exists\n',
+          [restId]:
+            'Migration failed. Reason: duplicate key value violates unique constraint "migrations_name_key"\n',
+        },
+      });
+
+      const fiber = yield* legacyWaitForHealthyServices(mock.spawner, [storageId, restId], {
+        timeoutSeconds: 1,
+        recovery: {
+          workdir: "/tmp/project",
+          platform: "linux",
+          storageContainerId: storageId,
+        },
+      }).pipe(Effect.provide(unusedHttpClientLayer), Effect.forkChild({ startImmediately: true }));
+
+      yield* TestClock.adjust("1 seconds");
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip);
+
+      expect(error.message).not.toContain("Storage migration state");
+      expect(error.message).not.toContain("--no-backup");
+    }),
+  );
+
+  it.effect("omits a no-op recovery recipe when the affected image cannot be inspected", () =>
+    Effect.gen(function* () {
+      const containerId = "supabase_inbucket_proj";
+      const mock = mockHealthSpawner(() => notRunning, {
+        logs: { [containerId]: "exec /mailpit: exec format error\n" },
+      });
+
+      const fiber = yield* legacyWaitForHealthyServices(mock.spawner, [containerId], {
+        timeoutSeconds: 1,
+        recovery: {
+          workdir: "/tmp/project",
+          platform: "linux",
+        },
+      }).pipe(Effect.provide(unusedHttpClientLayer), Effect.forkChild({ startImmediately: true }));
+
+      yield* TestClock.adjust("1 seconds");
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip);
+
+      expect(error.message).toContain("could not be determined automatically");
+      expect(error.message).not.toContain("docker image rm");
+      expect(error.message).not.toContain("supabase --workdir /tmp/project start");
+    }),
+  );
+
+  it.effect(
+    "combines image and Storage recovery into one ordered sequence and dedupes image references",
+    () =>
+      Effect.gen(function* () {
+        const mailpitId = "supabase_inbucket_proj";
+        const studioId = "supabase_studio_proj";
+        const storageId = "supabase_storage_proj";
+        const mailpitImage = "public.ecr.aws/supabase/mailpit:v1.30.2";
+        const studioImage = "public.ecr.aws/supabase/studio:2026.07.13-sha-b5ada96";
+        const mock = mockHealthSpawner(() => runningStarting, {
+          logs: {
+            [mailpitId]: "exec /mailpit: exec format error\n",
+            [studioId]:
+              "Error: Invalid package config /app/apps/studio/node_modules/next/package.json\n",
+            [storageId]:
+              'Migration failed. Reason: duplicate key value violates unique constraint "migrations_name_key"\n',
+          },
+          images: {
+            [mailpitId]: mailpitImage,
+            [studioId]: studioImage,
+          },
+        });
+
+        const fiber = yield* legacyWaitForHealthyServices(
+          mock.spawner,
+          [mailpitId, studioId, storageId],
+          {
+            timeoutSeconds: 1,
+            recovery: {
+              workdir: "/tmp/project",
+              platform: "linux",
+              storageContainerId: storageId,
+            },
+          },
+        ).pipe(Effect.provide(unusedHttpClientLayer), Effect.forkChild({ startImmediately: true }));
+
+        yield* TestClock.adjust("1 seconds");
+        const error = yield* Fiber.join(fiber).pipe(Effect.flip);
+
+        expect(error.message).toContain("cached Docker images");
+        expect(error.message).toContain("Storage migration state");
+        expect(error.message).toContain("supabase --workdir /tmp/project stop --no-backup");
+        expect(error.message).toContain(`docker image rm ${mailpitImage} ${studioImage}`);
+        expect(error.message.match(/supabase --workdir \/tmp\/project start/gu)).toHaveLength(1);
+      }),
+  );
+
+  it.effect("omits shell commands for Windows workdirs with expansion characters", () =>
+    Effect.gen(function* () {
+      const containerId = "supabase_inbucket_proj";
+      const image = "public.ecr.aws/supabase/mailpit:v1.30.2";
+      const mock = mockHealthSpawner(() => notRunning, {
+        logs: { [containerId]: "exec /mailpit: exec format error\n" },
+        images: { [containerId]: image },
+      });
+
+      const fiber = yield* legacyWaitForHealthyServices(mock.spawner, [containerId], {
+        timeoutSeconds: 1,
+        recovery: {
+          workdir: String.raw`C:\%PROJECT%\app`,
+          platform: "win32",
+        },
+      }).pipe(Effect.provide(unusedHttpClientLayer), Effect.forkChild({ startImmediately: true }));
+
+      yield* TestClock.adjust("1 seconds");
+      const error = yield* Fiber.join(fiber).pipe(Effect.flip);
+
+      expect(error.message).toContain(`Affected Docker image: ${image}`);
+      expect(error.message).toContain("could not be rendered safely");
+      expect(error.message).not.toContain("supabase --workdir");
+      expect(error.message).not.toContain("docker image rm");
     }),
   );
 

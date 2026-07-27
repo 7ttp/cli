@@ -110,6 +110,11 @@ export interface LegacyWaitForHealthyServicesOptions {
   readonly postgrest?: LegacyHealthCheckPostgrestGateway;
   /** See {@link LEGACY_EDGE_RUNTIME_READY_PATH}'s doc comment for why this reuses the same gateway shape as {@link postgrest}. */
   readonly edgeRuntime?: LegacyHealthCheckPostgrestGateway;
+  readonly recovery?: {
+    readonly workdir: string;
+    readonly platform: NodeJS.Platform;
+    readonly storageContainerId?: string;
+  };
 }
 
 /**
@@ -166,7 +171,10 @@ function legacyCheckHttpReady(
  * failure to stream logs must never mask the timeout error it was printed
  * alongside, so every failure here is swallowed.
  */
-function legacyStreamContainerLogsOnce(spawner: Spawner, containerId: string): Effect.Effect<void> {
+function legacyStreamContainerLogsOnce(
+  spawner: Spawner,
+  containerId: string,
+): Effect.Effect<LegacyUnhealthyContainerDiagnostics> {
   return Effect.scoped(
     Effect.gen(function* () {
       const handle = yield* spawnContainerCli(spawner, ["logs", containerId], {
@@ -174,33 +182,218 @@ function legacyStreamContainerLogsOnce(spawner: Spawner, containerId: string): E
         stdout: "pipe",
         stderr: "pipe",
       });
+      const stdoutDecoder = new TextDecoder();
+      const stderrDecoder = new TextDecoder();
+      let stdoutTail = "";
+      let stderrTail = "";
+      let cachedImageFailure = false;
+      let storageMigrationConflict = false;
+      const scan = (text: string): string => {
+        const lower = text.toLowerCase();
+        cachedImageFailure ||= [
+          "exec format error",
+          "err_invalid_package_config",
+          "invalid package config",
+        ].some((pattern) => lower.includes(pattern));
+        storageMigrationConflict ||=
+          lower.includes(
+            "migration failed. reason: duplicate key value violates unique constraint",
+          ) && lower.includes("migrations_name_key");
+        return text.slice(-256);
+      };
       yield* Effect.all(
         [
           Stream.runForEach(handle.stdout, (chunk) =>
             Effect.sync(() => {
               globalThis.process.stderr.write(chunk);
+              stdoutTail = scan(`${stdoutTail}${stdoutDecoder.decode(chunk, { stream: true })}`);
             }),
           ),
           Stream.runForEach(handle.stderr, (chunk) =>
             Effect.sync(() => {
               globalThis.process.stderr.write(chunk);
+              stderrTail = scan(`${stderrTail}${stderrDecoder.decode(chunk, { stream: true })}`);
             }),
           ),
         ],
         { concurrency: "unbounded" },
       );
       yield* handle.exitCode;
+      scan(`${stdoutTail}${stdoutDecoder.decode()}`);
+      scan(`${stderrTail}${stderrDecoder.decode()}`);
+      return {
+        containerId,
+        cachedImageFailure,
+        storageMigrationConflict,
+      };
     }),
-  ).pipe(Effect.orElseSucceed(() => undefined));
+  ).pipe(
+    Effect.orElseSucceed(() => ({
+      containerId,
+      cachedImageFailure: false,
+      storageMigrationConflict: false,
+    })),
+  );
 }
 
 /** Go's `fmt.Fprintln(os.Stderr, containerId, "container logs:")` (`start.go:218`) + the log dump itself. */
-function legacyDumpContainerLogs(spawner: Spawner, containerId: string): Effect.Effect<void> {
+function legacyDumpContainerLogs(
+  spawner: Spawner,
+  containerId: string,
+): Effect.Effect<LegacyUnhealthyContainerDiagnostics> {
   return Effect.gen(function* () {
     yield* Effect.sync(() => {
       globalThis.process.stderr.write(`${containerId} container logs:\n`);
     });
-    yield* legacyStreamContainerLogsOnce(spawner, containerId);
+    return yield* legacyStreamContainerLogsOnce(spawner, containerId);
+  });
+}
+
+interface LegacyUnhealthyContainerDiagnostics {
+  readonly containerId: string;
+  readonly cachedImageFailure: boolean;
+  readonly storageMigrationConflict: boolean;
+}
+
+function legacyInspectContainerImage(
+  spawner: Spawner,
+  containerId: string,
+): Effect.Effect<string | undefined> {
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const handle = yield* spawnContainerCli(
+        spawner,
+        ["container", "inspect", containerId, "--format", "{{.Config.Image}}"],
+        {
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      const stdoutDecoder = new TextDecoder();
+      let stdout = "";
+      const [exitCode] = yield* Effect.all(
+        [
+          handle.exitCode.pipe(Effect.map(Number)),
+          Stream.runForEach(handle.stdout, (chunk) =>
+            Effect.sync(() => {
+              stdout += stdoutDecoder.decode(chunk, { stream: true });
+            }),
+          ),
+          Stream.runForEach(handle.stderr, () => Effect.void),
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (exitCode !== 0) return undefined;
+      const image = `${stdout}${stdoutDecoder.decode()}`.trim();
+      return image.length > 0 ? image : undefined;
+    }),
+  ).pipe(Effect.orElseSucceed(() => undefined));
+}
+
+function legacyShellQuoteArg(arg: string, platform: NodeJS.Platform): string | undefined {
+  if (platform === "win32") {
+    if (/["%$`!\r\n]/u.test(arg)) return undefined;
+    return `"${arg}"`;
+  }
+  if (arg.length > 0 && /^[A-Za-z0-9_\-./:@%,+=]+$/.test(arg)) return arg;
+  return `'${arg.replaceAll("'", "'\\''")}'`;
+}
+
+function legacyBuildStartRecoverySuggestion(
+  spawner: Spawner,
+  containers: ReadonlyArray<LegacyUnhealthyContainerDiagnostics>,
+  recovery: LegacyWaitForHealthyServicesOptions["recovery"],
+): Effect.Effect<string> {
+  return Effect.gen(function* () {
+    if (recovery === undefined) return "";
+
+    const imageFailures = containers.filter((container) => container.cachedImageFailure);
+    const hasStorageConflict =
+      recovery.storageContainerId !== undefined &&
+      containers.some(
+        (container) =>
+          container.containerId === recovery.storageContainerId &&
+          container.storageMigrationConflict,
+      );
+    if (imageFailures.length === 0 && !hasStorageConflict) return "";
+
+    const inspectedImages = yield* Effect.forEach(
+      imageFailures,
+      (container) => legacyInspectContainerImage(spawner, container.containerId),
+      { concurrency: "unbounded" },
+    );
+    const hasUnresolvedImage = inspectedImages.some((image) => image === undefined);
+    const images = [
+      ...new Set(inspectedImages.flatMap((image) => (image === undefined ? [] : [image]))),
+    ];
+    const imageNoun = imageFailures.length === 1 ? "image" : "images";
+    const imageVerb = imageFailures.length === 1 ? "appears" : "appear";
+    const lines: Array<string> = [];
+    const workdirArg = legacyShellQuoteArg(recovery.workdir, recovery.platform);
+
+    if (workdirArg === undefined) {
+      lines.push(
+        imageFailures.length > 0
+          ? `The cached Docker ${imageNoun} ${imageVerb} corrupted or incompatible with the Docker daemon.`
+          : "The local database has conflicting Storage migration state.",
+      );
+      if (imageFailures.length > 0 && images.length > 0) {
+        lines.push(`Affected Docker ${imageNoun}: ${images.join(", ")}`);
+      }
+      if (hasStorageConflict) {
+        lines.push(
+          "Back up any local changes before resetting; a reset deletes local database data.",
+        );
+      }
+      lines.push(
+        "Recovery commands could not be rendered safely for this workdir. Run them with the same --workdir value used for this start.",
+      );
+      return lines.join("\n");
+    }
+
+    const stopCommand = `  supabase --workdir ${workdirArg} stop`;
+    const resetCommand = `${stopCommand} --no-backup`;
+    const startCommand = `  supabase --workdir ${workdirArg} start`;
+
+    if (imageFailures.length > 0 && hasUnresolvedImage) {
+      lines.push(
+        `The cached Docker ${imageNoun} ${imageVerb} corrupted or incompatible with the Docker daemon.`,
+        `The exact affected ${imageNoun} could not be determined automatically. Inspect the container logs above and remove each affected image by its exact tag before starting again.`,
+      );
+      if (hasStorageConflict) {
+        lines.push(
+          "The local database also has conflicting Storage migration state. Back up any local changes before resetting it; a reset deletes local database data.",
+        );
+      }
+      return lines.join("\n");
+    }
+
+    if (imageFailures.length > 0 && hasStorageConflict) {
+      lines.push(
+        `The cached Docker ${imageNoun} ${imageVerb} corrupted or incompatible with the Docker daemon, and the local database has conflicting Storage migration state.`,
+        "Back up any local changes first; the following deletes local database data:",
+        resetCommand,
+      );
+    } else if (imageFailures.length > 0) {
+      lines.push(
+        `The cached Docker ${imageNoun} ${imageVerb} corrupted or incompatible with the Docker daemon.`,
+        `Stop the local stack, remove the affected ${imageNoun}, and start again without deleting local database data:`,
+        stopCommand,
+      );
+    } else {
+      lines.push(
+        "The local database has conflicting Storage migration state.",
+        "Back up any local changes first; the following deletes local database data:",
+        resetCommand,
+      );
+    }
+
+    if (imageFailures.length > 0) {
+      lines.push(`  docker image rm ${images.join(" ")}`);
+    }
+    lines.push(startCommand);
+    return lines.join("\n");
   });
 }
 
@@ -278,14 +471,23 @@ export function legacyWaitForHealthyServices(
           // `!errors.Is(err, context.Canceled)`) — an interrupted fiber never
           // reaches this `Effect.catch` handler at all, so no separate check
           // is needed here.
-          yield* Effect.forEach(probeError.failures, (failure) =>
+          const containerDiagnostics = yield* Effect.forEach(probeError.failures, (failure) =>
             legacyDumpContainerLogs(spawner, failure.containerId),
           );
+          const recoverySuggestion = yield* legacyBuildStartRecoverySuggestion(
+            spawner,
+            containerDiagnostics,
+            opts.recovery,
+          );
+          const failureMessage = probeError.failures
+            .map((failure) => `${failure.containerId}: ${failure.reason}`)
+            .join("\n");
           return yield* Effect.fail(
             new LegacyHealthCheckTimeoutError({
-              message: probeError.failures
-                .map((failure) => `${failure.containerId}: ${failure.reason}`)
-                .join("\n"),
+              message:
+                recoverySuggestion.length > 0
+                  ? `${failureMessage}\n\n${recoverySuggestion}`
+                  : failureMessage,
               unhealthy: probeError.failures,
             }),
           );

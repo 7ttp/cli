@@ -75,6 +75,28 @@ Unlike the main path above, a failure on THIS path is not swallowed by
 `--ignore-health-check` — it replaces the original health error, rolls back, and fails the
 command (Go's `return seedErr` instead of the downgraded `return err`).
 
+### Health-failure recovery diagnostics
+
+When the final health-check attempt fails, `start` still streams each unhealthy
+container's logs to stderr. While streaming, it now recognizes the issue-specific
+signatures `exec format error`, Studio's `ERR_INVALID_PACKAGE_CONFIG`/`Invalid package
+config`, and Storage's full duplicate-`migrations_name_key` migration failure without
+retaining the full logs in memory. The migration signature is accepted only from the
+known Storage container. For the image signatures, it performs one best-effort
+`docker container inspect <id> --format {{.Config.Image}}` per affected container before
+rollback removes it, so the resulting error can name the exact registry-qualified image
+tag to remove rather than suggesting a broad image prune.
+
+The diagnostic is advisory only: `start` never deletes an image or a pre-existing volume
+automatically. Image-only failures suggest `supabase stop`, targeted `docker image rm`,
+then `supabase start`, preserving local database data. A Storage migration conflict
+instead requires a fresh local database; that recovery explicitly warns that
+`supabase stop --no-backup` deletes local data. When both signatures occur, one ordered
+sequence combines the targeted image removal with the warned data reset. Suggested
+Supabase commands carry a platform-appropriate rendering of the resolved `--workdir`.
+No command recipe is printed when an affected image tag cannot be resolved or the
+workdir cannot be rendered safely for the current platform's shell.
+
 ## Files Read
 
 | Path                                                                                            | Format | When                                                                                                                                                                             |
@@ -226,6 +248,9 @@ output modes.
   volume) → Postgres create+start+health-wait → `Starting containers...` → (image
   pre-pull) → per-container create+start → `Waiting for health checks...` → `Started
 supabase local development setup.`
+- stderr (conditional health timeout): unhealthy-container logs, followed by a targeted
+  cached-image recovery sequence and/or a warned local-data reset when the recognized
+  issue signatures above are present.
 - stdout: the `status` pretty table (rounded box, same renderer `supabase status` uses).
 - stderr: the local-dev security notice block (bind-to-`0.0.0.0` / shared-default-keys /
   no-auth-on-Studio-pgMeta-analytics warning).
