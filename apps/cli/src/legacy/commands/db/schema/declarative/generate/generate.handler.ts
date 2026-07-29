@@ -118,10 +118,8 @@ export const legacyDbSchemaDeclarativeGenerate = Effect.fn("legacy.db.schema.dec
       // used as-is: Go's config resolver only prefixes the workdir onto a RELATIVE path
       // (`config.resolve`), leaving an absolute path unchanged. `path.join(workdir, abs)`
       // would mangle `/repo` + `/abs` into `/repo/abs`.
-      const declarativeDir = path.resolve(
-        cliConfig.workdir,
-        legacyResolveDeclarativeDir(path, toml.pgDelta),
-      );
+      const declarativeDirRel = legacyResolveDeclarativeDir(path, toml.pgDelta);
+      const declarativeDir = path.resolve(cliConfig.workdir, declarativeDirRel);
       const migrationsDir = path.join(cliConfig.workdir, "supabase", "migrations");
       const local: LegacyLocalConn = { port: toml.port, password: toml.password };
 
@@ -272,7 +270,13 @@ export const legacyDbSchemaDeclarativeGenerate = Effect.fn("legacy.db.schema.dec
           ...(linkedProjectRef !== undefined ? { projectRef: linkedProjectRef } : {}),
         });
       }
-      yield* output.raw(`Declarative schema written to ${legacyBold(declarativeDir)}\n`, "stderr");
+      // Go prints `utils.GetDeclarativeDir()` verbatim (`declarative.go:156`): the
+      // relative dir, never the resolved absolute path, because Go chdirs into the
+      // workdir. Same rendering as `db pull` (`pull.go:119`).
+      yield* output.raw(
+        `Declarative schema written to ${legacyBold(declarativeDirRel)}\n`,
+        "stderr",
+      );
     }).pipe(
       // Go's `ensureProjectGroupsCached` PersistentPostRun (`cmd/root.go:176,214-234`)
       // writes the linked-project cache (`GET /v1/projects/{ref}` →

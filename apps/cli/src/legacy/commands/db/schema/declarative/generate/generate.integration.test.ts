@@ -357,9 +357,13 @@ describe("legacy db schema declarative generate integration", () => {
         ),
       );
       expect(written).toBe("create table players ();");
-      expect(s.out.rawChunks.some((c) => c.text.includes("Declarative schema written to"))).toBe(
-        true,
+      // Go prints `utils.GetDeclarativeDir()` verbatim (`declarative.go:156`) — the
+      // relative dir, never the resolved absolute path, same as `db pull` (pull.go:119).
+      const writtenLine = s.out.rawChunks.find((c) =>
+        c.text.includes("Declarative schema written to"),
       );
+      expect(writtenLine?.text).toContain(join("supabase", "database"));
+      expect(writtenLine?.text).not.toContain(tmp.current);
       // Go runs ensureLocalDatabaseStarted before generating from local.
       expect(s.ensureStartedCalls).toBe(1);
     }).pipe(Effect.provide(s.layer));
