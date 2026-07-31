@@ -763,7 +763,20 @@ describe("legacyEnsureStartVolume", () => {
     );
   });
 
-  it.live("fails on any non-zero exit, with no already-exists tolerance", () => {
+  it.live("treats podman's already-exists rejection as success", () => {
+    const mock = mockSpawner(() => ({
+      exitCode: 125,
+      stderr:
+        "Error: volume with name supabase_edge_runtime_proj already exists: volume already exists\n",
+    }));
+    return legacyEnsureStartVolume(mock.spawner, "supabase_edge_runtime_proj", {}).pipe(
+      Effect.map(() => {
+        // Just needs to not fail — no return value to assert on.
+      }),
+    );
+  });
+
+  it.live("still fails on docker's spec-mismatch conflict, like Go's API call", () => {
     const mock = mockSpawner(() => ({
       exitCode: 1,
       stderr:

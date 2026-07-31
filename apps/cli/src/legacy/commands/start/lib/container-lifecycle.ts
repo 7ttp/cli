@@ -284,10 +284,24 @@ export function legacyEnsureStartNetwork(
 }
 
 /**
+ * Podman's CLI rejects a repeated volume name outright (`volume with name X
+ * already exists`), unlike `docker volume create` and the engine API Go called
+ * — both idempotent, including Podman's own Docker-compat socket. Match only
+ * that phrasing: Docker's spec-mismatch conflict ("a volume named X already
+ * exists but was not created for the current specification") stays fatal,
+ * exactly as it is for Go's API call.
+ */
+function legacyIsVolumeAlreadyExistsError(stderr: string): boolean {
+  return /volume with name .* already exists/iu.test(stderr);
+}
+
+/**
  * Go's per-source-name `Docker.VolumeCreate` call (`docker.go:407-415`) via
- * `docker volume create --label ...`. Unlike network creation, Go applies no
- * "already exists" tolerance here — `VolumeCreate` is already idempotent for a
- * repeated name with matching options, so any non-zero exit is a real failure.
+ * `docker volume create --label ...`. Go's API call is idempotent for a
+ * repeated name, so an already-exists rejection from the podman CLI is treated
+ * as that same success — `supabase stop` preserves volumes, so every
+ * stop→start cycle re-ensures existing ones (#6020). Any other non-zero exit
+ * is a real failure.
  */
 export function legacyEnsureStartVolume(
   spawner: Spawner,
@@ -322,7 +336,7 @@ export function legacyEnsureStartVolume(
           () => new LegacyStartVolumeCreateError({ message: "failed to create volume" }),
         ),
       );
-      if (exitCode !== 0) {
+      if (exitCode !== 0 && !legacyIsVolumeAlreadyExistsError(stderr)) {
         const message = stderr.trim();
         return yield* Effect.fail(
           new LegacyStartVolumeCreateError({
