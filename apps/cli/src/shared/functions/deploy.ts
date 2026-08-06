@@ -29,6 +29,7 @@ import {
 } from "./functions.shared.ts";
 import {
   ConflictingFunctionDeployFlagsError,
+  FunctionDeployStepError,
   FunctionDeployCancelledError,
   InvalidFunctionDeploySlugError,
   NoFunctionsToDeployError,
@@ -1107,6 +1108,11 @@ function createBundledMetadata(
   };
 }
 
+const deployStepError = (step: string, cause: unknown) =>
+  new FunctionDeployStepError({
+    message: `failed to ${step}: ${cause instanceof Error ? cause.message : String(cause)}`,
+  });
+
 function collectByteStream(stream: Stream.Stream<Uint8Array, unknown>) {
   const decoder = new TextDecoder();
   return Stream.runFold(
@@ -1409,16 +1415,26 @@ const bundleFunctionWithDocker = Effect.fnUntraced(function* (
   yield* output.raw(`Bundling Function: ${styleEmphasis(config.slug)}\n`, "stderr");
 
   const outputRoot = resolve(functionsDir, "..", ".temp");
-  yield* Effect.tryPromise(() => mkdir(outputRoot, { recursive: true }));
-  const outputDir = yield* Effect.tryPromise(() =>
-    mkdtemp(join(outputRoot, `.supabase-output-${config.slug}-`)),
-  );
+  yield* Effect.tryPromise({
+    try: () => mkdir(outputRoot, { recursive: true }),
+    catch: (error) => deployStepError(`create bundle output directory ${outputRoot}`, error),
+  });
+  const outputDir = yield* Effect.tryPromise({
+    try: () => mkdtemp(join(outputRoot, `.supabase-output-${config.slug}-`)),
+    catch: (error) => deployStepError(`create bundle staging directory in ${outputRoot}`, error),
+  });
   try {
-    yield* Effect.tryPromise(() => chmod(outputDir, 0o777));
-    const outputPath = join(outputDir, "output.eszip");
-    const binds = yield* Effect.promise(() =>
-      buildDockerBinds(projectId, functionsDir, outputDir, config),
+    // World-writability is only needed for BitBucket's bind-mount requirement
+    // (Go relies on `MkdirAll(dir, 0777)` alone, `internal/functions/deploy/bundle.go:37`); best-effort
+    // because Windows can reject chmod on a directory (#6104).
+    yield* Effect.tryPromise(() => chmod(outputDir, 0o777)).pipe(
+      Effect.orElseSucceed(() => undefined),
     );
+    const outputPath = join(outputDir, "output.eszip");
+    const binds = yield* Effect.tryPromise({
+      try: () => buildDockerBinds(projectId, functionsDir, outputDir, config),
+      catch: (error) => deployStepError("resolve docker bind mounts", error),
+    });
     const networkMode = dockerNetworkId ?? localDockerId("network", projectId);
     yield* ensureDockerNetwork(networkMode, projectId);
     yield* ensureDockerNamedVolume(localDockerId("edge_runtime", projectId), projectId);
@@ -1837,7 +1853,7 @@ export const discoverFunctionSlugs = Effect.fnUntraced(function* (
       const cause = error.cause;
       return cause instanceof Error && "code" in cause && cause.code === "ENOENT"
         ? Effect.succeed(undefined)
-        : Effect.fail(error);
+        : Effect.fail(deployStepError(`list functions in ${functionsDir}`, cause ?? error));
     }),
   );
   if (entries !== undefined) {

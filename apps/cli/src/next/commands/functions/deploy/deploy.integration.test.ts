@@ -1544,6 +1544,41 @@ describe("functions deploy", () => {
     }).pipe(Effect.ensuring(cleanupTempDir(repoRoot)));
   });
 
+  // #6104: a failing deploy filesystem step must surface the step name and
+  // the underlying cause, never the generic `Effect.tryPromise` UnknownError.
+  it.live("names the bundler step and preserves the cause when output setup fails", () => {
+    const tempDir = makeTempDir();
+    const child = mockChildProcessSpawner({ exitCode: 0 });
+
+    return Effect.gen(function* () {
+      yield* Effect.promise(() => writeProjectConfig(tempDir));
+      yield* Effect.promise(() => writeLocalFunction(tempDir, "hello-world"));
+      // A regular file where the bundler wants its `.temp` output directory.
+      yield* Effect.promise(() => writeFile(join(tempDir, "supabase", ".temp"), "not a dir\n"));
+
+      const { layer } = setup(tempDir, {
+        rawArgs: ["functions", "deploy", "hello-world", "--use-docker"],
+        childLayer: child.layer,
+      });
+
+      const exit = yield* Effect.exit(
+        functionsDeploy({
+          ...BASE_FLAGS,
+          functionNames: ["hello-world"],
+          useDocker: true,
+        }).pipe(Effect.provide(layer)),
+      );
+
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) {
+        const rendered = String(exit.cause);
+        expect(rendered).toContain("FunctionDeployStepError");
+        expect(rendered).toContain("failed to create bundle output directory");
+        expect(rendered).not.toContain("An error occurred in Effect.tryPromise");
+      }
+    }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+  });
+
   it.live("keeps the nearest git root as the source boundary", () => {
     const outerRoot = makeTempDir();
     const repoRoot = join(outerRoot, "nested-repo");
