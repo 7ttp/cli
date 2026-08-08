@@ -1190,13 +1190,31 @@ function shouldUseDenoJsonDiscovery(entrypoint: string, importMap: string) {
   return isDenoConfigFile(importMap) && dirname(importMap) === dirname(entrypoint);
 }
 
-function isUserDefinedDockerNetwork(networkMode: string) {
+/**
+ * Go's `container.NetworkMode.IsUserDefined()`
+ * (`api/types/container/hostconfig_unix.go:23`) — the guard Go runs inside
+ * `DockerNetworkCreateIfNotExists` (`internal/utils/docker.go:65`) before it
+ * creates anything.
+ *
+ * `container:<id>` selects another container's network namespace rather than
+ * naming a network, so Go never creates one for it. Docker does accept
+ * `docker network create container:<id>` as a literal name, and `--network
+ * container:<id>` still resolves to container mode regardless, so skipping
+ * this check does not fail loudly — it just leaves an unreferenced bridge
+ * network behind on every run.
+ *
+ * Go splits on the first `:` and compares the head to `container`
+ * (`hostconfig.go:493-499`), which a prefix test matches exactly, empty id
+ * included.
+ */
+export function isUserDefinedDockerNetwork(networkMode: string) {
   return (
     networkMode.length > 0 &&
     networkMode !== "default" &&
     networkMode !== "bridge" &&
     networkMode !== "host" &&
-    networkMode !== "none"
+    networkMode !== "none" &&
+    !networkMode.startsWith("container:")
   );
 }
 
