@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { Data, Effect, FileSystem, Path, Result } from "effect";
 
 import { Output } from "../../shared/output/output.service.ts";
-import type { LegacyDbSession } from "./legacy-db-connection.service.ts";
+import { legacyPinStepDownRole, type LegacyDbSession } from "./legacy-db-connection.service.ts";
 import { legacyGlobPattern, legacyResolveUnderWorkdir, legacyWalkSqlFiles } from "./legacy-glob.ts";
 import {
   legacyCreateSeedTable,
@@ -198,6 +198,7 @@ export const legacyApplySeedFiles = (
           );
       const txn = Effect.gen(function* () {
         yield* session.exec("BEGIN");
+        yield* legacyPinStepDownRole(session);
         if (!seed.dirty) {
           for (const statement of statements) yield* session.exec(statement);
         }

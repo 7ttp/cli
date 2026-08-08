@@ -3,7 +3,7 @@ import { Effect, type FileSystem, Option, type Path } from "effect";
 import { legacyListLocalMigrations } from "./legacy-pgdelta.cache.ts";
 import { legacyBold } from "./legacy-colors.ts";
 import type { LegacyDbExecError } from "./legacy-db-connection.errors.ts";
-import type { LegacyDbSession } from "./legacy-db-connection.service.ts";
+import { legacyPinStepDownRole, type LegacyDbSession } from "./legacy-db-connection.service.ts";
 import {
   LEGACY_MIGRATION_VERSION_MAX,
   legacyParseMigrationVersion,
@@ -78,6 +78,7 @@ export const MIGRATE_FILE_PATTERN = /^([0-9]+)_(.*)\.sql$/u;
 export const legacyCreateMigrationTable = (session: LegacyDbSession) =>
   Effect.gen(function* () {
     yield* session.exec("BEGIN");
+    yield* legacyPinStepDownRole(session);
     yield* session.exec(SET_LOCAL_LOCK_TIMEOUT);
     yield* session.exec(CREATE_VERSION_SCHEMA);
     yield* session.exec(CREATE_VERSION_TABLE);
@@ -94,6 +95,7 @@ export const legacyCreateMigrationTable = (session: LegacyDbSession) =>
 export const legacyCreateSeedTable = (session: LegacyDbSession) =>
   Effect.gen(function* () {
     yield* session.exec("BEGIN");
+    yield* legacyPinStepDownRole(session);
     yield* session.exec(SET_LOCAL_LOCK_TIMEOUT);
     yield* session.exec(CREATE_VERSION_SCHEMA);
     yield* session.exec(CREATE_SEED_TABLE);

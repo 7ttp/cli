@@ -53,13 +53,14 @@ Notes/Delegation section below).
 
 ## API Routes / DB
 
-| Method | Path / SQL                                          | Auth   | Purpose                          |
-| ------ | --------------------------------------------------- | ------ | -------------------------------- |
-| POST   | `/v1/projects/{ref}/roles`                          | Bearer | Temp login role when no password |
-| GET    | `/v1/projects/{ref}/pooler/config`                  | Bearer | IPv4 pooler fallback             |
-| GET    | `/v1/projects/{ref}`                                | Bearer | Linked-project cache (post-run)  |
-| SQL    | `SELECT version FROM …schema_migrations`            | —      | history reconciliation (remote)  |
-| SQL    | `INSERT … ON CONFLICT … schema_migrations` (UPSERT) | —      | history update (on confirmation) |
+| Method | Path / SQL                                                                       | Auth   | Purpose                                                                                                             |
+| ------ | -------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/v1/projects/{ref}/roles`                                                       | Bearer | Temp login role when no password                                                                                    |
+| GET    | `/v1/projects/{ref}/pooler/config`                                               | Bearer | IPv4 pooler fallback                                                                                                |
+| GET    | `/v1/projects/{ref}`                                                             | Bearer | Linked-project cache (post-run)                                                                                     |
+| SQL    | `SELECT version FROM …schema_migrations`                                         | —      | history reconciliation (remote)                                                                                     |
+| SQL    | `INSERT … ON CONFLICT … schema_migrations` (UPSERT)                              | —      | history update (on confirmation)                                                                                    |
+| SQL    | `SET LOCAL ROLE postgres` (first statement of the setup and upsert transactions) | —      | only when the remote session stepped down from a temp `cli_login_*`/`supabase_admin` login role (supabase/cli#6116) |
 
 ## Environment Variables
 

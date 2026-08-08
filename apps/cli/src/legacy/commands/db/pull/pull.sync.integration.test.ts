@@ -15,10 +15,13 @@ import { legacyUpdateMigrationHistory, type LegacyPulledMigration } from "./pull
 // can assert the transaction envelope (BEGIN / UPSERT / COMMIT / ROLLBACK) around
 // the version writes. `failUpsertAt` fails the Nth upsert to simulate a dropped
 // connection mid-loop.
-function mockSession(opts: { readonly failUpsertAt?: number } = {}) {
+function mockSession(
+  opts: { readonly failUpsertAt?: number; readonly stepDownRole?: "postgres" } = {},
+) {
   const calls: Array<string> = [];
   let upsertCount = 0;
   const session: LegacyDbSession = {
+    ...(opts.stepDownRole !== undefined ? { stepDownRole: opts.stepDownRole } : {}),
     exec: (sql: string) => Effect.sync(() => void calls.push(sql)),
     query: (sql: string) => {
       if (/INSERT INTO supabase_migrations/u.test(sql)) {
@@ -69,6 +72,27 @@ describe("legacyUpdateMigrationHistory", () => {
       expect(out.stderrText).toContain(
         "Repaired migration history: [20240101000000 20240101000001] => applied",
       );
+    }).pipe(Effect.provide(BunServices.layer)),
+  );
+
+  it.effect("pins the postgres role inside both transactions for a stepped-down session", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = mkdtempSync(join(tmpdir(), "pull-sync-"));
+      const migrations = writeMigrations(dir);
+      const out = mockOutput();
+      const { session, calls } = mockSession({ stepDownRole: "postgres" });
+
+      yield* legacyUpdateMigrationHistory(session, fs, path, migrations).pipe(
+        Effect.provide(out.layer),
+      );
+
+      const begins = calls.flatMap((sql, i) => (sql === "BEGIN" ? [i] : []));
+      expect(begins.length).toBeGreaterThan(1);
+      for (const i of begins) {
+        expect(calls[i + 1]).toBe("SET LOCAL ROLE postgres");
+      }
     }).pipe(Effect.provide(BunServices.layer)),
   );
 

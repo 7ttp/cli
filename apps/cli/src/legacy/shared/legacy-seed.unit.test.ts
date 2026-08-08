@@ -9,10 +9,15 @@ import { mockOutput } from "../../../tests/helpers/mocks.ts";
 import type { LegacyDbSession } from "./legacy-db-connection.service.ts";
 import { legacyApplySeedFiles } from "./legacy-seed.ts";
 
-function fakeSession() {
+function fakeSession(opts: { stepDownRole?: "postgres" } = {}) {
+  const execs: Array<string> = [];
   const queries: Array<{ sql: string; params?: ReadonlyArray<unknown> }> = [];
   const session: LegacyDbSession = {
-    exec: () => Effect.void,
+    ...(opts.stepDownRole !== undefined ? { stepDownRole: opts.stepDownRole } : {}),
+    exec: (sql) =>
+      Effect.sync(() => {
+        execs.push(sql);
+      }),
     query: (sql, params) =>
       Effect.sync(() => {
         queries.push({ sql, params });
@@ -22,7 +27,7 @@ function fakeSession() {
     copyToCsv: () => Effect.succeed(new Uint8Array()),
     queryRaw: () => Effect.succeed({ fields: [], rows: [], commandTag: "" }),
   };
-  return { session, queries };
+  return { session, execs, queries };
 }
 
 const run = (
@@ -54,6 +59,25 @@ describe("legacyApplySeedFiles seed glob", () => {
           );
           expect(upsert?.params?.[0]).toBe("seed.sql");
           expect(out.rawChunks.map((c) => c.text)).toContain("Seeding data from seed.sql...\n");
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
+  it.effect("pins the postgres role inside every transaction for a stepped-down session", () => {
+    const dir = mkdtempSync(join(tmpdir(), "legacy-seed-"));
+    writeFileSync(join(dir, "seed.sql"), "insert into t values (1);");
+    const { session, execs } = fakeSession({ stepDownRole: "postgres" });
+    const out = mockOutput();
+    return run(session, dir, ["seed.sql"], out).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const begins = execs.flatMap((sql, i) => (sql === "BEGIN" ? [i] : []));
+          expect(begins.length).toBeGreaterThan(1);
+          for (const i of begins) {
+            expect(execs[i + 1]).toBe("SET LOCAL ROLE postgres");
+          }
           rmSync(dir, { recursive: true, force: true });
         }),
       ),

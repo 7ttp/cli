@@ -51,7 +51,8 @@ declare module "pg" {
 // (e.g. `CREATE EXTENSION`) execute as `postgres` rather than the temp role.
 const SUPERUSER_ROLE = "supabase_admin";
 const CLI_LOGIN_PREFIX = "cli_login_";
-const SET_SESSION_ROLE = "SET SESSION ROLE postgres";
+const STEP_DOWN_ROLE = "postgres";
+const SET_SESSION_ROLE = `SET SESSION ROLE ${STEP_DOWN_ROLE}`;
 
 // Postgres date / timestamp / timestamptz type OIDs. node-postgres' default parsers
 // decode these into a JS `Date`, which is millisecond-resolution and applies the
@@ -87,6 +88,28 @@ const legacyQueryRawTypes = {
 function needsRoleStepDown(user: string): boolean {
   const base = user.split(".")[0] ?? user;
   return base.toLowerCase() === SUPERUSER_ROLE || base.startsWith(CLI_LOGIN_PREFIX);
+}
+
+/**
+ * The step-down role for a connection, or `undefined` when none applies. Single
+ * source for both the connect-time `SET SESSION ROLE` and the session's
+ * {@link LegacyDbSession.stepDownRole}, so the two can never disagree. Exported
+ * for unit tests: a regression here silently disables every pin.
+ */
+export function legacyStepDownRoleFor(user: string, isLocal: boolean): "postgres" | undefined {
+  return !isLocal && needsRoleStepDown(user) ? STEP_DOWN_ROLE : undefined;
+}
+
+/**
+ * The `stepDownRole` slice of the returned session, spread into it by `connect`.
+ * Extracted so the wiring that makes every `SET LOCAL ROLE` pin fire in production
+ * is itself covered — the mocked sessions in the pin tests set the field directly,
+ * so dropping it here would otherwise leave the whole suite green.
+ */
+export function legacyStepDownSessionFields(
+  stepDownRole: "postgres" | undefined,
+): Pick<LegacyDbSession, "stepDownRole"> {
+  return stepDownRole === undefined ? {} : { stepDownRole };
 }
 
 // pgconn terminates the multi-host fallback chain (rather than trying the next
@@ -615,7 +638,8 @@ const connect = (
     // Whether the remote step-down runs on this connection. Go installs the
     // `AfterConnect` hook only on the remote path (`ConnectByConfigStream`,
     // `connect.go:342-362`), not `ConnectLocalPostgres`, so gate on `!isLocal`.
-    const stepDownRequired = !isLocal && needsRoleStepDown(cfg.user);
+    const stepDownRole = legacyStepDownRoleFor(cfg.user, isLocal);
+    const stepDownRequired = stepDownRole !== undefined;
     // Build the primary connection over a self-managed `pg.Pool` (via
     // `PgClient.fromPool`) rather than `PgClient.make`, so we control two pool
     // behaviors `PgClient.make` does not expose: `idleTimeoutMillis: 0` (never reap
@@ -840,6 +864,7 @@ const connect = (
     });
 
     const session: LegacyDbSession = {
+      ...legacyStepDownSessionFields(stepDownRole),
       exec: (sql) => client.unsafe(sql).pipe(Effect.asVoid, Effect.mapError(legacyToExecError)),
       query: (sql, params) =>
         client

@@ -36,6 +36,7 @@ interface SetupOpts {
   readonly args?: ReadonlyArray<string>;
   readonly failSql?: string;
   readonly failResolve?: boolean;
+  readonly stepDownRole?: "postgres";
 }
 
 function setup(workdir: string, opts: SetupOpts = {}) {
@@ -74,6 +75,7 @@ function setup(workdir: string, opts: SetupOpts = {}) {
   const connection = Layer.succeed(LegacyDbConnection, {
     connect: () =>
       Effect.succeed({
+        ...(opts.stepDownRole !== undefined ? { stepDownRole: opts.stepDownRole } : {}),
         exec: (sql: string) =>
           Effect.suspend(() => {
             execs.push(sql);
@@ -143,6 +145,19 @@ const seedMigration = (workdir: string, name: string, body: string) => {
 const tmp = useLegacyTempWorkdir();
 
 describe("legacy migration repair", () => {
+  it.live("pins the postgres role inside every transaction for a stepped-down session", () => {
+    seedMigration(tmp.current, "20240101000000_init.sql", "create table a;\n");
+    const { layer, execs } = setup(tmp.current, { stepDownRole: "postgres" });
+    return Effect.gen(function* () {
+      yield* legacyMigrationRepair(input({ versions: ["20240101000000"], status: "applied" }));
+      const begins = execs.flatMap((sql: string, i: number) => (sql === "BEGIN" ? [i] : []));
+      expect(begins.length).toBeGreaterThan(1);
+      for (const i of begins) {
+        expect(execs[i + 1]).toBe("SET LOCAL ROLE postgres");
+      }
+    }).pipe(Effect.provide(layer));
+  });
+
   it.live("marks a version as applied by upserting from its local file", () => {
     seedMigration(tmp.current, "20240101000000_init.sql", "create table a;\n");
     const { layer, execs, queries, out } = setup(tmp.current);

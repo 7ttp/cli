@@ -1,7 +1,7 @@
 import { Data, Effect } from "effect";
 
 import { Output } from "../../shared/output/output.service.ts";
-import type { LegacyDbSession } from "./legacy-db-connection.service.ts";
+import { legacyPinStepDownRole, type LegacyDbSession } from "./legacy-db-connection.service.ts";
 
 /** Reading or updating `vault.secrets` failed (Go's `UpsertVaultSecrets` errors). */
 export class LegacyMigrationVaultError extends Data.TaggedError("LegacyMigrationVaultError")<{
@@ -51,6 +51,7 @@ export const legacyUpsertVaultSecrets = (
     // One transaction, mirroring Go's implicitly-transactional `SendBatch`.
     const batch = Effect.gen(function* () {
       yield* session.exec("BEGIN");
+      yield* legacyPinStepDownRole(session);
       for (const secret of resolved) {
         const id = existingByName.get(secret.name);
         if (id !== undefined) {

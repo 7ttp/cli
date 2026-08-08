@@ -76,6 +76,7 @@ function mockConnection(opts: {
   enableFails?: boolean;
   queryFails?: boolean;
   listFails?: boolean;
+  stepDownRole?: "postgres";
 }) {
   const execs: Array<string> = [];
   const linted: Array<string> = [];
@@ -83,6 +84,7 @@ function mockConnection(opts: {
   const layer = Layer.succeed(LegacyDbConnection, {
     connect: () =>
       Effect.succeed({
+        ...(opts.stepDownRole !== undefined ? { stepDownRole: opts.stepDownRole } : {}),
         extensionExists: () => Effect.succeed(false),
         copyToCsv: () => Effect.succeed(new Uint8Array()),
         queryRaw: () => Effect.succeed({ fields: [], rows: [], commandTag: "" }),
@@ -171,6 +173,7 @@ interface SetupOpts {
   enableFails?: boolean;
   queryFails?: boolean;
   listFails?: boolean;
+  stepDownRole?: "postgres";
   /** Raw CLI args for `CliArgs` — drives DB target selection (Changed-based). */
   args?: ReadonlyArray<string>;
 }
@@ -185,6 +188,7 @@ function setup(opts: SetupOpts = {}) {
     enableFails: opts.enableFails,
     queryFails: opts.queryFails,
     listFails: opts.listFails,
+    ...(opts.stepDownRole !== undefined ? { stepDownRole: opts.stepDownRole } : {}),
   });
   const telemetry = mockLegacyTelemetryStateTracked();
   const processControl = mockProcessControl();
@@ -229,6 +233,26 @@ describe("legacy db lint", () => {
       expect(out.stderrText).toContain("Linting schema: public");
       // Begin / enable extension / rollback all ran on the session.
       expect(connection.execs).toEqual(["begin", LEGACY_ENABLE_PGSQL_CHECK, "rollback"]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("pins the postgres role before enabling the extension on a linked lint", () => {
+    const { layer, out, connection } = setup({
+      schemas: [],
+      checkRows: { public: [checkRow("f1", [ERROR_ISSUE])] },
+      isLocal: false,
+      stepDownRole: "postgres",
+    });
+    return Effect.gen(function* () {
+      yield* legacyDbLint(flags({ schema: ["public"] }));
+      expect(out.stdoutText).not.toBe("");
+      // CREATE EXTENSION must run as postgres, not the temp login role.
+      expect(connection.execs).toEqual([
+        "begin",
+        "SET LOCAL ROLE postgres",
+        LEGACY_ENABLE_PGSQL_CHECK,
+        "rollback",
+      ]);
     }).pipe(Effect.provide(layer));
   });
 

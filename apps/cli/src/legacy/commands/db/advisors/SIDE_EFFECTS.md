@@ -35,8 +35,10 @@ Go's permissive `type X string` structs. `--type` selects which endpoints run:
 
 ## Database (`--local` / `--db-url`)
 
-One connection. Within one transaction: `BEGIN` → `set local search_path = ''`
-(setup half of `templates/lints.sql`) → the multi-CTE lints query → `ROLLBACK`.
+One connection. Within one transaction: `BEGIN` → `SET LOCAL ROLE postgres` (only
+when the remote session stepped down from a temp `cli_login_*`/`supabase_admin`
+login role, supabase/cli#6116) → `set local search_path = ''` (setup half of
+`templates/lints.sql`) → the multi-CTE lints query → `ROLLBACK`.
 `--type` filters the resulting rows by category (`SECURITY` / `PERFORMANCE`).
 
 ## Environment Variables

@@ -2,7 +2,7 @@ import { Data, Effect, type FileSystem, type Path } from "effect";
 
 import { Output } from "../../shared/output/output.service.ts";
 import type { LegacyDbExecError } from "./legacy-db-connection.errors.ts";
-import type { LegacyDbSession } from "./legacy-db-connection.service.ts";
+import { legacyPinStepDownRole, type LegacyDbSession } from "./legacy-db-connection.service.ts";
 import {
   INSERT_MIGRATION_VERSION,
   MIGRATE_FILE_PATTERN,
@@ -152,6 +152,9 @@ const TYPE_NAME_PATTERN = /type "([^"]+)" does not exist/;
  * insert goes in the final batch, so the migration is recorded only after every
  * statement succeeds. A file with no such statements is a single `BEGIN`/`COMMIT`.
  *
+ * Each batch re-pins a stepped-down session's role ({@link legacyPinStepDownRole}),
+ * a deliberate divergence from Go; the standalone statements cannot be pinned.
+ *
  * Does NOT create the history table and does NOT `RESET ALL` — Go's `ExecBatch` does
  * neither; those are the migration-apply path's responsibility (`ApplyMigrations`,
  * apply.go:65-69), so role/globals files (`legacySeedGlobals`) stay reset-free like Go.
@@ -211,6 +214,7 @@ const execMigrationBatch = <E>(
       pending = [];
       const base = executed;
       const body = Effect.gen(function* () {
+        yield* legacyPinStepDownRole(session);
         for (const [offset, item] of items.entries()) {
           const index = base + offset;
           if (item.kind === "version") {

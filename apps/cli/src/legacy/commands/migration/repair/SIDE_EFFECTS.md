@@ -50,7 +50,9 @@ repair-all) `TRUNCATE`, plus `applied` → per-version `UPSERT` from the local f
 > half-updated state. The TS port wraps the same statements in an explicit
 > `BEGIN`/`COMMIT` with `ROLLBACK` on error, so a partial failure leaves the table
 > unchanged. This is a deliberate, safer divergence (`LegacyDbSession` has no batch
-> primitive); the success path is byte-identical to Go.
+> primitive); the success path is byte-identical to Go. When the remote session
+> stepped down from a temp `cli_login_*`/`supabase_admin` login role, the
+> transaction opens with `SET LOCAL ROLE postgres` (supabase/cli#6116).
 
 ### `--output-format json`
 

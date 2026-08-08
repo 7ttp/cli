@@ -13,6 +13,7 @@ import { legacyAqua } from "../../../shared/legacy-colors.ts";
 import { legacyLoadProjectEnv } from "../../../shared/legacy-db-config.toml-read.ts";
 import { LegacyDbConfigResolver } from "../../../shared/legacy-db-config.service.ts";
 import {
+  legacyPinStepDownRole,
   LegacyDbConnection,
   type LegacyDbSession,
 } from "../../../shared/legacy-db-connection.service.ts";
@@ -81,6 +82,7 @@ const updateMigrationTable = Effect.fnUntraced(function* (
 
   const txn = Effect.gen(function* () {
     yield* session.exec("BEGIN");
+    yield* legacyPinStepDownRole(session);
     if (repairAll) yield* session.exec(TRUNCATE_VERSION_TABLE);
     if (status === "applied") {
       for (const file of appliedFiles) {

@@ -7,7 +7,10 @@ import { ProcessControl } from "../../../../shared/runtime/process-control.servi
 import { LegacyProjectRefResolver } from "../../../config/legacy-project-ref.service.ts";
 import { legacyFailsOn } from "../../../shared/legacy-fail-on.ts";
 import { LegacyDbConfigResolver } from "../../../shared/legacy-db-config.service.ts";
-import { LegacyDbConnection } from "../../../shared/legacy-db-connection.service.ts";
+import {
+  legacyPinStepDownRole,
+  LegacyDbConnection,
+} from "../../../shared/legacy-db-connection.service.ts";
 import type { LegacyDbSession } from "../../../shared/legacy-db-connection.service.ts";
 import { LegacyLinkedProjectCache } from "../../../telemetry/legacy-linked-project-cache.service.ts";
 import { LegacyTelemetryState } from "../../../telemetry/legacy-telemetry-state.service.ts";
@@ -152,6 +155,9 @@ const runLint = Effect.fnUntraced(function* (
                 message: `failed to begin transaction: ${cause.message}`,
               }),
           ),
+        );
+        yield* legacyPinStepDownRole(session).pipe(
+          Effect.mapError((cause) => new LegacyDbLintBeginTxError({ message: cause.message })),
         );
         // Lint never commits — always roll back, matching Go's deferred rollback
         // (`lint.go:120-124`). A rollback failure is printed to stderr, not fatal.

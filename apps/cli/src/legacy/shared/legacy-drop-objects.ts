@@ -1,6 +1,6 @@
 import { Data, Effect } from "effect";
 
-import type { LegacyDbSession } from "./legacy-db-connection.service.ts";
+import { legacyPinStepDownRole, type LegacyDbSession } from "./legacy-db-connection.service.ts";
 
 /** Dropping the user schemas failed (Go's `DropUserSchemas` error). */
 export class LegacyMigrationDropError extends Data.TaggedError("LegacyMigrationDropError")<{
@@ -155,8 +155,18 @@ end $$;
  * Drops every user-created object, matching Go's `migration.DropUserSchemas`
  * (`pkg/migration/drop.go:34`): one batched DO-block statement (a single
  * statement is atomic in Postgres, so no explicit transaction is needed).
+ * A stepped-down session wraps it in one so the block's policy drops carry the
+ * pin ({@link legacyPinStepDownRole}).
  */
 export const legacyDropUserSchemas = (session: LegacyDbSession) =>
-  session
-    .exec(LEGACY_DROP_OBJECTS_SQL)
-    .pipe(Effect.mapError((cause) => new LegacyMigrationDropError({ message: cause.message })));
+  Effect.gen(function* () {
+    if (session.stepDownRole === undefined) {
+      return yield* session.exec(LEGACY_DROP_OBJECTS_SQL);
+    }
+    yield* session.exec("BEGIN");
+    yield* Effect.gen(function* () {
+      yield* legacyPinStepDownRole(session);
+      yield* session.exec(LEGACY_DROP_OBJECTS_SQL);
+      yield* session.exec("COMMIT");
+    }).pipe(Effect.tapError(() => session.exec("ROLLBACK").pipe(Effect.ignore)));
+  }).pipe(Effect.mapError((cause) => new LegacyMigrationDropError({ message: cause.message })));

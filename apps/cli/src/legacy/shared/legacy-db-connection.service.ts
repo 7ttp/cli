@@ -1,8 +1,8 @@
-import { Context, type Effect, type Scope } from "effect";
+import { Context, Effect, type Scope } from "effect";
 import type { LegacyConnectSuggestionContext } from "./legacy-connect-errors.ts";
-import type {
-  LegacyDbConnectError,
-  LegacyDbCopyError,
+import {
+  type LegacyDbConnectError,
+  type LegacyDbCopyError,
   LegacyDbExecError,
 } from "./legacy-db-connection.errors.ts";
 
@@ -158,7 +158,44 @@ export interface LegacyDbSession {
   readonly queryRaw: (
     sql: string,
   ) => Effect.Effect<LegacyQueryResult, LegacyDbExecError | LegacyDbConnectError>;
+  /**
+   * The role a remote session stepped down to after authenticating as a
+   * `cli_login_*` or `supabase_admin` login role, platform-minted or named by
+   * `--db-url`; `undefined` for local connections and for sessions already
+   * authenticated as their target role. Typed as the literal so no driver can
+   * route a non-constant value into the SQL below. See
+   * {@link legacyPinStepDownRole}.
+   */
+  readonly stepDownRole?: "postgres";
 }
+
+/**
+ * Re-pins {@link LegacyDbSession.stepDownRole} with `SET LOCAL ROLE` as the first
+ * statement after `BEGIN`; a no-op when the session never stepped down.
+ *
+ * The connect-time `SET SESSION ROLE` is session state, so it stops governing
+ * statements once the connection's backend changes under it (transaction pooling,
+ * a pool redial). supautils gates policy DDL on tables `postgres` does not own —
+ * `realtime.messages`, `auth.users`, `storage.objects` — on the CURRENT role name,
+ * so an unpinned statement fails with `must be owner of …`, and any object it does
+ * create is owned by the temp role the platform later drops (supabase/cli#6116).
+ * Standalone pipeline-incompatible statements have no transaction to pin, keeping
+ * Go's exposure there.
+ */
+export const legacyPinStepDownRole = (
+  session: LegacyDbSession,
+): Effect.Effect<void, LegacyDbExecError> =>
+  session.stepDownRole === undefined
+    ? Effect.void
+    : session.exec(`SET LOCAL ROLE ${session.stepDownRole}`).pipe(
+        Effect.mapError(
+          (cause) =>
+            new LegacyDbExecError({
+              ...cause,
+              message: `failed to re-pin the stepped-down role (SET LOCAL ROLE ${session.stepDownRole}): ${cause.message}`,
+            }),
+        ),
+      );
 
 /** Full result metadata for `db query` (see {@link LegacyDbSession.queryRaw}). */
 export interface LegacyQueryResult {

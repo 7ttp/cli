@@ -3,7 +3,7 @@ import { Effect, type FileSystem, Option, type Path } from "effect";
 
 import { Output } from "../../shared/output/output.service.ts";
 import type { LegacyDbExecError } from "./legacy-db-connection.errors.ts";
-import type { LegacyDbSession } from "./legacy-db-connection.service.ts";
+import { legacyPinStepDownRole, type LegacyDbSession } from "./legacy-db-connection.service.ts";
 import { legacyCreateSeedTable } from "./legacy-migration-history.ts";
 import { LEGACY_BAD_PATTERN_MESSAGE, legacyPathMatch } from "./legacy-path-match.ts";
 import { legacySplitAndTrim } from "./legacy-sql-split.ts";
@@ -294,6 +294,7 @@ export const legacySeedData = <E>(
       const statements = seed.dirty ? [] : lines;
       yield* session.exec("BEGIN");
       const body = Effect.gen(function* () {
+        yield* legacyPinStepDownRole(session);
         for (const statement of statements) yield* session.exec(statement);
         yield* session.query(UPSERT_SEED_FILE, [seed.path, seed.hash]);
         yield* session.exec("COMMIT");

@@ -42,6 +42,9 @@ Prints `Applying migration <file>...` to stderr per pending migration, then
 `Local database is up to date.` to stdout. Connects, lists remote + local
 migrations, computes the pending set, upserts `[db.vault]` secrets, and applies
 each pending migration transactionally. Does **not** seed (matches Go `up`).
+When the remote session stepped down from a temp `cli_login_*`/`supabase_admin`
+login role, every transaction opens with `SET LOCAL ROLE postgres`
+(supabase/cli#6116).
 
 ### `--output-format json`
 

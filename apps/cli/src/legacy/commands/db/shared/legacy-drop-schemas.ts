@@ -1,7 +1,10 @@
 import { Effect } from "effect";
 
 import type { LegacyDbExecError } from "../../../shared/legacy-db-connection.errors.ts";
-import type { LegacyDbSession } from "../../../shared/legacy-db-connection.service.ts";
+import {
+  legacyPinStepDownRole,
+  type LegacyDbSession,
+} from "../../../shared/legacy-db-connection.service.ts";
 
 /**
  * Verbatim port of Go's embedded `pkg/migration/queries/drop.sql`
@@ -162,6 +165,9 @@ export const legacyDropUserSchemas = <E>(
     // params (e.g. `options=-c statement_timeout=…`) before the destructive drop, so
     // the remote `db reset --db-url` path must NOT reset (matches Go's ExecBatch).
     yield* session.exec("BEGIN");
+    yield* legacyPinStepDownRole(session).pipe(
+      Effect.tapError(() => session.exec("ROLLBACK").pipe(Effect.ignore)),
+    );
     yield* session
       .exec(DROP_OBJECTS)
       .pipe(Effect.tapError(() => session.exec("ROLLBACK").pipe(Effect.ignore)));

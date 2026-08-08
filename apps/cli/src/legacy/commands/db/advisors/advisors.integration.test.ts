@@ -100,11 +100,13 @@ function mockConnection(opts: {
   rows?: ReadonlyArray<Record<string, unknown>>;
   setupFails?: boolean;
   queryFails?: boolean;
+  stepDownRole?: "postgres";
 }) {
   const execs: Array<string> = [];
   const layer = Layer.succeed(LegacyDbConnection, {
     connect: () =>
       Effect.succeed({
+        ...(opts.stepDownRole !== undefined ? { stepDownRole: opts.stepDownRole } : {}),
         extensionExists: () => Effect.succeed(false),
         copyToCsv: () => Effect.succeed(new Uint8Array()),
         queryRaw: () => Effect.succeed({ fields: [], rows: [], commandTag: "" }),
@@ -214,6 +216,7 @@ interface SetupOpts {
   securityNonJson?: boolean;
   securityLints?: ReadonlyArray<Record<string, unknown>>;
   performanceLints?: ReadonlyArray<Record<string, unknown>>;
+  stepDownRole?: "postgres";
   /** Raw CLI args for `CliArgs` — drives DB target selection (Changed-based). */
   args?: ReadonlyArray<string>;
 }
@@ -225,6 +228,7 @@ function setup(opts: SetupOpts = {}) {
     rows: opts.rows,
     setupFails: opts.setupFails,
     queryFails: opts.queryFails,
+    ...(opts.stepDownRole !== undefined ? { stepDownRole: opts.stepDownRole } : {}),
   });
   const telemetry = mockLegacyTelemetryStateTracked();
   const processControl = mockProcessControl();
@@ -320,6 +324,14 @@ describe("legacy db advisors — local", () => {
       expect(out.stdoutText).toBe(expected);
       expect(out.stderrText).toContain("Connecting to local database...");
       expect(connection.execs).toEqual(["begin", SETUP_SQL, "rollback"]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("pins the postgres role inside the advisors transaction when stepped down", () => {
+    const { layer, connection } = setup({ rows: [], stepDownRole: "postgres" });
+    return Effect.gen(function* () {
+      yield* legacyDbAdvisors(flags({}));
+      expect(connection.execs).toEqual(["begin", "SET LOCAL ROLE postgres", SETUP_SQL, "rollback"]);
     }).pipe(Effect.provide(layer));
   });
 

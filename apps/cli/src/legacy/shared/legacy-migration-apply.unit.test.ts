@@ -27,10 +27,12 @@ function fakeSession(
   opts: {
     failOn?: string;
     failWith?: { message: string; code?: string; detail?: string; position?: number };
+    stepDownRole?: "postgres";
   } = {},
 ) {
   const calls: Array<{ kind: "exec" | "query"; sql: string; params?: ReadonlyArray<unknown> }> = [];
   const session: LegacyDbSession = {
+    ...(opts.stepDownRole !== undefined ? { stepDownRole: opts.stepDownRole } : {}),
     exec: (sql) => {
       calls.push({ kind: "exec", sql });
       return opts.failOn !== undefined && sql.includes(opts.failOn)
@@ -164,6 +166,114 @@ describe("legacyApplyMigrationFile", () => {
           // The migration is still recorded once every statement succeeds.
           const insert = calls.find((c) => c.kind === "query");
           expect(insert?.params?.[0]).toBe("20240101120000");
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
+  it.effect("re-pins the step-down role inside every transaction it opens", () => {
+    const dir = mkdtempSync(join(tmpdir(), "legacy-apply-"));
+    const file = join(dir, "20240101120000_policy.sql");
+    writeFileSync(
+      file,
+      "CREATE POLICY p ON realtime.messages FOR ALL TO authenticated USING (true);\nCREATE INDEX CONCURRENTLY a_idx ON a(id);\nALTER TABLE a ENABLE ROW LEVEL SECURITY;",
+    );
+    const { session, calls } = fakeSession({ stepDownRole: "postgres" });
+    return run(session, file).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const execs = calls.filter((c) => c.kind === "exec").map((c) => c.sql);
+          for (const [i, sql] of execs.entries()) {
+            if (sql === "BEGIN") {
+              expect(execs[i + 1]).toBe("SET LOCAL ROLE postgres");
+            }
+          }
+          expect(execs.indexOf("SET LOCAL ROLE postgres")).toBeLessThan(
+            execs.indexOf("CREATE SCHEMA IF NOT EXISTS supabase_migrations"),
+          );
+          // Standalone statements have no transaction to pin.
+          const concurrently = execs.indexOf("CREATE INDEX CONCURRENTLY a_idx ON a(id)");
+          expect(execs[concurrently - 1]).not.toBe("SET LOCAL ROLE postgres");
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
+  it.effect("keeps At-statement indices and ROLLBACK intact when a pinned statement fails", () => {
+    const dir = mkdtempSync(join(tmpdir(), "legacy-apply-"));
+    const file = join(dir, "20240101120000_boom.sql");
+    writeFileSync(file, "create table a (id int);\nALTER TABLE a ADD COLUMN b int;");
+    const { session, calls } = fakeSession({
+      failOn: "ADD COLUMN b int",
+      stepDownRole: "postgres",
+    });
+    return run(session, file).pipe(
+      Effect.exit,
+      Effect.tap((exit) =>
+        Effect.sync(() => {
+          expect(Exit.isFailure(exit)).toBe(true);
+          const execs = calls.filter((c) => c.kind === "exec").map((c) => c.sql);
+          const lastBegin = execs.lastIndexOf("BEGIN");
+          expect(execs[lastBegin + 1]).toBe("SET LOCAL ROLE postgres");
+          expect(execs).toContain("ROLLBACK");
+          // The pin is not a counted statement.
+          if (Exit.isFailure(exit)) {
+            const msg = JSON.stringify(exit.cause);
+            expect(msg).toContain("At statement: 1");
+            expect(msg).toContain("ALTER TABLE a ADD COLUMN b int");
+          }
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
+  it.effect("surfaces a distinct error and rolls back when the pin itself fails", () => {
+    const dir = mkdtempSync(join(tmpdir(), "legacy-globals-"));
+    const file = join(dir, "roles.sql");
+    writeFileSync(file, "CREATE ROLE my_role;");
+    const { session, calls } = fakeSession({
+      failOn: "SET LOCAL ROLE",
+      failWith: { message: 'permission denied to set role "postgres"', code: "42501" },
+      stepDownRole: "postgres",
+    });
+    return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const exit = yield* legacySeedGlobals(
+        session,
+        fs,
+        path,
+        [file],
+        (message) => new TestError({ message }),
+      ).pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) {
+        const msg = JSON.stringify(exit.cause);
+        expect(msg).toContain("failed to re-pin the stepped-down role");
+        expect(msg).toContain("permission denied to set role");
+        expect(msg).not.toContain("At statement:");
+      }
+      expect(calls.some((c) => c.kind === "exec" && c.sql === "ROLLBACK")).toBe(true);
+      rmSync(dir, { recursive: true, force: true });
+    }).pipe(
+      Effect.provide(mockOutput({ format: "text" }).layer),
+      Effect.provide(BunServices.layer),
+    );
+  });
+
+  it.effect("emits no role pin when the session did not step down", () => {
+    const dir = mkdtempSync(join(tmpdir(), "legacy-apply-"));
+    const file = join(dir, "20240101120000_add_col.sql");
+    writeFileSync(file, "ALTER TABLE a ADD COLUMN b int;");
+    const { session, calls } = fakeSession();
+    return run(session, file).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const execs = calls.filter((c) => c.kind === "exec").map((c) => c.sql);
+          expect(execs.some((sql) => sql.startsWith("SET LOCAL ROLE"))).toBe(false);
           rmSync(dir, { recursive: true, force: true });
         }),
       ),

@@ -10,6 +10,8 @@ import {
   legacyBuildRawPgConfig,
   legacyInstallPoolErrorSwallow,
   legacyPoolStepDownVerify,
+  legacyStepDownRoleFor,
+  legacyStepDownSessionFields,
   legacyIsTerminalConnectError,
   legacyIsUnixSocketHost,
   legacyMergedConnectionOptions,
@@ -360,6 +362,40 @@ describe("legacyBuildPoolConfig", () => {
     expect(remote.verify).toBe(legacyPoolStepDownVerify);
     const local = legacyBuildPoolConfig({ ...base }, "127.0.0.1", 54322, false, 2, false);
     expect("verify" in local).toBe(false);
+  });
+});
+
+describe("legacyStepDownRoleFor", () => {
+  it("steps down remote temp login roles, with or without a Supavisor tenant suffix", () => {
+    expect(legacyStepDownRoleFor("cli_login_abc123", false)).toBe("postgres");
+    expect(legacyStepDownRoleFor("cli_login_abc123.projectref", false)).toBe("postgres");
+  });
+
+  it("steps down supabase_admin case-insensitively (Go's EqualFold)", () => {
+    expect(legacyStepDownRoleFor("supabase_admin", false)).toBe("postgres");
+    expect(legacyStepDownRoleFor("SUPABASE_ADMIN", false)).toBe("postgres");
+  });
+
+  it("never steps down an already-postgres or custom user", () => {
+    expect(legacyStepDownRoleFor("postgres", false)).toBeUndefined();
+    expect(legacyStepDownRoleFor("postgres.projectref", false)).toBeUndefined();
+    expect(legacyStepDownRoleFor("custom_role", false)).toBeUndefined();
+  });
+
+  it("never steps down local connections, regardless of user (Go ConnectLocalPostgres parity)", () => {
+    expect(legacyStepDownRoleFor("supabase_admin", true)).toBeUndefined();
+    expect(legacyStepDownRoleFor("cli_login_abc123", true)).toBeUndefined();
+  });
+});
+
+describe("legacyStepDownSessionFields", () => {
+  it("carries the role onto the session so every SET LOCAL ROLE pin can fire", () => {
+    expect(legacyStepDownSessionFields("postgres")).toEqual({ stepDownRole: "postgres" });
+  });
+
+  it("omits the field entirely when the connection never stepped down", () => {
+    expect(legacyStepDownSessionFields(undefined)).toEqual({});
+    expect("stepDownRole" in legacyStepDownSessionFields(undefined)).toBe(false);
   });
 });
 

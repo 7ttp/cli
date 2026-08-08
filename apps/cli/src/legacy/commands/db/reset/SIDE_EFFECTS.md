@@ -56,28 +56,29 @@ remote path produces whatever the delegated Go binary writes.
 
 ## Subprocesses
 
-| Command                                                                             | When                                  | Purpose                                                                         |
-| ----------------------------------------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------- |
-| `docker container inspect supabase_db_<project>`                                    | local path                            | `AssertSupabaseDbIsRunning` probe (Podman fallback)                             |
-| `docker container rm -f supabase_db_<project>` / `docker volume rm -f <same>`       | local path, PG15                      | remove the existing container/volume before recreating (Podman fallback)        |
-| `docker network create` / `docker volume create` / `docker create` / `docker start` | local path, PG15                      | recreate the Postgres container (same primitives `db start` uses)               |
-| `docker run --rm <realtime\|storage\|gotrue image>`                                 | local path, PG15, per enabled service | the one-shot `initSchema15` migrate jobs (`legacyStartSetupLocalDatabase`)      |
-| `docker restart <db container>`                                                     | local path, PG14                      | `RestartDatabase` — pg_cron must restart after `pg_terminate_backend`           |
-| `docker restart <storage\|auth\|realtime\|pooler container>`                        | local path, both PG14 and PG15        | concurrent satellite-container restart, not-found tolerated per service         |
-| `docker container inspect <kong container>` + `docker exec <kong> kong reload`      | local path, both PG14 and PG15        | reload Kong so it re-resolves the restarted containers' addresses (issue #6016) |
-| `docker container inspect supabase_storage_<project>`                               | local path                            | storage-health gate before bucket seeding                                       |
-| `supabase-go db reset --linked\|--db-url … [--no-seed]`                             | `--experimental` remote, no version   | the un-ported experimental schema-files apply path (telemetry disabled)         |
+| Command                                                                             | When                                  | Purpose                                                                                                                                                                          |
+| ----------------------------------------------------------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker container inspect supabase_db_<project>`                                    | local path                            | `AssertSupabaseDbIsRunning` probe (Podman fallback)                                                                                                                              |
+| `docker container rm -f supabase_db_<project>` / `docker volume rm -f <same>`       | local path, PG15                      | remove the existing container/volume before recreating (Podman fallback)                                                                                                         |
+| `docker network create` / `docker volume create` / `docker create` / `docker start` | local path, PG15                      | recreate the Postgres container (same primitives `db start` uses)                                                                                                                |
+| `docker run --rm <realtime\|storage\|gotrue image>`                                 | local path, PG15, per enabled service | the one-shot `initSchema15` migrate jobs (`legacyStartSetupLocalDatabase`)                                                                                                       |
+| `docker restart <db container>`                                                     | local path, PG14                      | `RestartDatabase` — pg_cron must restart after `pg_terminate_backend`                                                                                                            |
+| `docker restart <storage\|auth\|realtime\|pooler container>`                        | local path, both PG14 and PG15        | concurrent satellite-container restart, not-found tolerated per service                                                                                                          |
+| `docker container inspect <kong container>` + `docker exec <kong> kong reload`      | local path, both PG14 and PG15        | reload Kong so it re-resolves the restarted containers' addresses (issue #6016)                                                                                                  |
+| `docker container inspect supabase_storage_<project>`                               | local path                            | storage-health gate before bucket seeding                                                                                                                                        |
+| `supabase-go db reset --linked\|--db-url … [--no-seed]`                             | `--experimental` remote, no version   | the un-ported experimental schema-files apply path (telemetry disabled); the Go binary carries only the session-level step-down, not the per-transaction pin (supabase/cli#6116) |
 
 ## Database Mutations
 
 ### Remote path (native, in TS)
 
-| Statement                                                                                                                                        | When                                                         |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ |
-| `drop.sql` `DO` block (drops user schemas/extensions/public objects, truncates auth/migrations)                                                  | always, first                                                |
-| `SELECT vault.update_secret(...)` / `vault.create_secret(...)`                                                                                   | when `[db.vault]` has syncable secrets                       |
-| migration statements + `schema_migrations` history insert (per file, transactional; pipeline-incompatible statements run standalone — see Notes) | when `[db.migrations].enabled`, for migrations `≤ --version` |
-| seed statements + `seed_files` hash upsert                                                                                                       | when `[db.seed].enabled` and not `--no-seed`                 |
+| Statement                                                                                                                                        | When                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `drop.sql` `DO` block (drops user schemas/extensions/public objects, truncates auth/migrations)                                                  | always, first                                                                                                       |
+| `SELECT vault.update_secret(...)` / `vault.create_secret(...)`                                                                                   | when `[db.vault]` has syncable secrets                                                                              |
+| migration statements + `schema_migrations` history insert (per file, transactional; pipeline-incompatible statements run standalone — see Notes) | when `[db.migrations].enabled`, for migrations `≤ --version`                                                        |
+| seed statements + `seed_files` hash upsert                                                                                                       | when `[db.seed].enabled` and not `--no-seed`                                                                        |
+| `SET LOCAL ROLE postgres` (first statement of every transaction above, drop block included)                                                      | only when the remote session stepped down from a temp `cli_login_*`/`supabase_admin` login role (supabase/cli#6116) |
 
 ### Local path (native, in TS)
 

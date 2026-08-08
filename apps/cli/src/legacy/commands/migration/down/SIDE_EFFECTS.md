@@ -42,6 +42,9 @@ Prints `Resetting database to version: <version>` to stderr, then drops every
 user schema/object (the bundled `drop.sql` DO-block), upserts `[db.vault]`
 secrets, and re-applies local migrations `<= version` plus seed files (each gated
 on `db.migrations.enabled` / `db.seed.enabled`). Nothing is written to stdout.
+When the remote session stepped down from a temp `cli_login_*`/`supabase_admin`
+login role, the drop block and every transaction open with `SET LOCAL ROLE
+postgres` (supabase/cli#6116).
 
 ### `--output-format json`
 

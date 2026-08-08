@@ -1,7 +1,10 @@
 import { Effect, type FileSystem, type Path } from "effect";
 
 import { Output } from "../../../../shared/output/output.service.ts";
-import type { LegacyDbSession } from "../../../shared/legacy-db-connection.service.ts";
+import {
+  legacyPinStepDownRole,
+  type LegacyDbSession,
+} from "../../../shared/legacy-db-connection.service.ts";
 import {
   MIGRATE_FILE_PATTERN,
   UPSERT_MIGRATION_VERSION,
@@ -71,6 +74,7 @@ export const legacyUpdateMigrationHistory = (
       // remote history that fails the next pull's sync check.
       yield* Effect.gen(function* () {
         yield* session.exec("BEGIN");
+        yield* legacyPinStepDownRole(session);
         for (const entry of resolved) {
           const content = yield* fs.readFileString(entry.migrationPath);
           const statements = legacySplitAndTrim(content);

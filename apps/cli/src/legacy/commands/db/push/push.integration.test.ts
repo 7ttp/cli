@@ -83,12 +83,14 @@ function mockConnection(opts: {
   noSeedTable?: boolean;
   failExec?: string;
   failExecWith?: { message: string; code?: string; detail?: string; position?: number };
+  stepDownRole?: "postgres";
 }) {
   const execs: Array<string> = [];
   const queries: Array<{ sql: string; params?: ReadonlyArray<unknown> }> = [];
   const layer = Layer.succeed(LegacyDbConnection, {
     connect: () =>
       Effect.succeed({
+        ...(opts.stepDownRole !== undefined ? { stepDownRole: opts.stepDownRole } : {}),
         extensionExists: () => Effect.succeed(false),
         copyToCsv: () => Effect.succeed(new Uint8Array()),
         queryRaw: () => Effect.succeed({ fields: [], rows: [], commandTag: "" }),
@@ -166,6 +168,7 @@ function setup(
     noSeedTable?: boolean;
     failExec?: string;
     failExecWith?: { message: string; code?: string; detail?: string; position?: number };
+    stepDownRole?: "postgres";
     catalogStdout?: string;
     catalogExportFailWith?: string;
     noProjectId?: boolean;
@@ -340,6 +343,46 @@ describe("legacy db push", () => {
       expect(conn.queries.some((q) => q.sql.includes("INSERT INTO supabase_migrations"))).toBe(
         true,
       );
+    });
+  });
+
+  it.live("pins the postgres role inside every transaction of a linked push", () => {
+    const { layer, out, conn } = setup(tmp.current, {
+      toml: 'project_id = "test"\n\n[db.vault]\nmy_secret = "v1"\n',
+      files: {
+        ...migrationFile("20240101000000"),
+        "supabase/seed.sql": "insert into t values (1);",
+      },
+      args: ["db", "push"],
+      confirm: [true, true],
+      isLocal: false,
+      projectRef: LEGACY_VALID_REF,
+      stepDownRole: "postgres",
+    });
+    return Effect.gen(function* () {
+      yield* legacyDbPush({ ...DEFAULT_FLAGS, local: false, includeSeed: true }).pipe(
+        Effect.provide(layer),
+      );
+      expect(out.stdoutText).toContain("Finished");
+      expect(out.stderrText).toContain("Seeding data from supabase/seed.sql...");
+      const begins = conn.execs.flatMap((sql, i) => (sql === "BEGIN" ? [i] : []));
+      expect(begins.length).toBeGreaterThan(2);
+      for (const i of begins) {
+        expect(conn.execs[i + 1]).toBe("SET LOCAL ROLE postgres");
+      }
+    });
+  });
+
+  it.live("applies a local migration without any role pin", () => {
+    const { layer, out, conn } = setup(tmp.current, {
+      toml: 'project_id = "test"\n',
+      files: migrationFile("20240101000000"),
+      confirm: [true],
+    });
+    return Effect.gen(function* () {
+      yield* legacyDbPush(DEFAULT_FLAGS).pipe(Effect.provide(layer));
+      expect(out.stdoutText).toContain("Finished");
+      expect(conn.execs.some((sql) => sql.startsWith("SET LOCAL ROLE"))).toBe(false);
     });
   });
 

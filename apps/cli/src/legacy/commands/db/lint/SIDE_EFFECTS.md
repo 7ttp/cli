@@ -36,10 +36,11 @@ resolve credentials); the lint itself issues no advisor/API requests.
 One connection (local / `--db-url` / linked-direct). Within one transaction:
 
 1. `BEGIN`
-2. (when `--schema` is omitted) `ListUserSchemas` — `... not nspname like any($1)` with the managed-schemas array bound as `$1`
-3. `CREATE EXTENSION IF NOT EXISTS plpgsql_check`
-4. per schema: `SELECT p.proname, plpgsql_check_function(p.oid, format:='json') …` (`templates/check.sql`)
-5. `ROLLBACK` (always — lint has no committed effects)
+2. `SET LOCAL ROLE postgres` — only when the remote session stepped down from a temp `cli_login_*`/`supabase_admin` login role, so the `CREATE EXTENSION` below runs as `postgres` (supabase/cli#6116)
+3. (when `--schema` is omitted) `ListUserSchemas` — `... not nspname like any($1)` with the managed-schemas array bound as `$1`
+4. `CREATE EXTENSION IF NOT EXISTS plpgsql_check`
+5. per schema: `SELECT p.proname, plpgsql_check_function(p.oid, format:='json') …` (`templates/check.sql`)
+6. `ROLLBACK` (always — lint has no committed effects)
 
 Requires `plpgsql_check` to be installable; a bare vanilla `--db-url` without
 the extension fails at step 3 (matching Go).
