@@ -4,6 +4,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 
 import {
   containerCliExitCode,
+  legacyChildResult,
   legacyContainerRuntimeNotFoundMessage,
   legacyDescribeContainerCliFailure,
   legacyDockerSupportsVolumePruneAllFlag,
@@ -93,6 +94,89 @@ describe("spawnContainerCli", () => {
       }),
     );
   });
+});
+
+/** A bare handle whose exit code resolves immediately with configurable stdio streams. */
+function makeTestHandle(opts: {
+  readonly exitCode: number;
+  readonly stdout?: Stream.Stream<Uint8Array>;
+  readonly stderr?: Stream.Stream<Uint8Array>;
+}) {
+  return Effect.gen(function* () {
+    const exitDeferred = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+    yield* Deferred.succeed(exitDeferred, ChildProcessSpawner.ExitCode(opts.exitCode));
+    return ChildProcessSpawner.makeHandle({
+      pid: ChildProcessSpawner.ProcessId(1),
+      stdout: opts.stdout ?? Stream.empty,
+      stderr: opts.stderr ?? Stream.empty,
+      all: Stream.empty,
+      exitCode: Deferred.await(exitDeferred),
+      isRunning: Effect.succeed(false),
+      stdin: Sink.drain,
+      kill: () => Effect.void,
+      unref: Effect.succeed(Effect.void),
+      getInputFd: () => Sink.drain,
+      getOutputFd: () => Stream.empty,
+    });
+  });
+}
+
+const encoded = (text: string) => new TextEncoder().encode(text);
+
+describe("legacyChildResult", () => {
+  it.live("collects both streams to completion when they end normally", () =>
+    Effect.gen(function* () {
+      const handle = yield* makeTestHandle({
+        exitCode: 0,
+        stdout: Stream.make(encoded("payload")),
+        stderr: Stream.make(encoded("warning")),
+      });
+      const result = yield* legacyChildResult(handle, { stdout: true, stderr: true });
+      expect(result).toEqual({ exitCode: 0, stdout: "payload", stderr: "warning" });
+    }).pipe(Effect.scoped),
+  );
+
+  it.live(
+    "returns within the bounded grace with partial text when a stream never reaches EOF",
+    () =>
+      Effect.gen(function* () {
+        const handle = yield* makeTestHandle({
+          exitCode: 1,
+          stderr: Stream.concat(Stream.make(encoded("No such container")), Stream.never),
+        });
+        const result = yield* legacyChildResult(handle, { stderr: true });
+        expect(result).toEqual({ exitCode: 1, stdout: "", stderr: "No such container" });
+      }).pipe(Effect.scoped),
+    10_000,
+  );
+
+  it.live(
+    "collects output that arrives after the exit code has already resolved",
+    () =>
+      Effect.gen(function* () {
+        const handle = yield* makeTestHandle({
+          exitCode: 1,
+          stderr: Stream.concat(
+            Stream.fromEffect(Effect.as(Effect.sleep("150 millis"), encoded("late error"))),
+            Stream.never,
+          ),
+        });
+        const result = yield* legacyChildResult(handle, { stderr: true });
+        expect(result.stderr).toBe("late error");
+      }).pipe(Effect.scoped),
+    10_000,
+  );
+
+  it.live("leaves uncollected streams empty", () =>
+    Effect.gen(function* () {
+      const handle = yield* makeTestHandle({
+        exitCode: 0,
+        stdout: Stream.make(encoded("ignored")),
+      });
+      const result = yield* legacyChildResult(handle, { stderr: true });
+      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+    }).pipe(Effect.scoped),
+  );
 });
 
 describe("containerCliExitCode", () => {

@@ -1,11 +1,11 @@
-import { Effect, FileSystem, Layer, Option, Path, Stream } from "effect";
+import { Effect, FileSystem, Layer, Option, Path } from "effect";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
 
 import { LegacyNetworkIdFlag, LegacyProfileFlag } from "../../../../shared/legacy/global-flags.ts";
 import { resolveBinary } from "../../../../shared/legacy/go-proxy.layer.ts";
 import { LegacyCliConfig } from "../../../config/legacy-cli-config.service.ts";
-import { spawnContainerCli } from "../../../shared/legacy-container-cli.ts";
+import { legacyChildResult, spawnContainerCli } from "../../../shared/legacy-container-cli.ts";
 import { legacyResolveDbImage } from "../../../shared/legacy-db-image.ts";
 import { legacyReadDbToml } from "../../../shared/legacy-db-config.toml-read.ts";
 import { legacyGetRegistryImageUrl } from "../../../shared/legacy-docker-registry.ts";
@@ -112,24 +112,13 @@ export const legacyDeclarativeSeamLayer = Layer.effect(
                   }),
               ),
             );
-            const chunks: Array<Uint8Array> = [];
-            yield* Stream.runForEach(handle.stdout, (chunk) =>
-              Effect.sync(() => {
-                chunks.push(chunk);
-              }),
-            ).pipe(Effect.mapError(() => failure()));
-            const exitCode = yield* handle.exitCode.pipe(Effect.mapError(() => failure()));
+            const { exitCode, stdout } = yield* legacyChildResult(handle, { stdout: true }).pipe(
+              Effect.mapError(() => failure()),
+            );
             if (exitCode !== 0) {
               return yield* Effect.fail(failure(exitCode));
             }
-            const total = chunks.reduce((size, chunk) => size + chunk.length, 0);
-            const bytes = new Uint8Array(total);
-            let offset = 0;
-            for (const chunk of chunks) {
-              bytes.set(chunk, offset);
-              offset += chunk.length;
-            }
-            return new TextDecoder().decode(bytes).trim();
+            return stdout.trim();
           }),
         ),
       ensureLocalDatabaseStarted: () =>
@@ -168,22 +157,10 @@ export const legacyDeclarativeSeamLayer = Layer.effect(
                   }),
               ),
             );
-            const stderrChunks: Array<Uint8Array> = [];
-            yield* Stream.runForEach(child.stderr, (chunk) =>
-              Effect.sync(() => {
-                stderrChunks.push(chunk);
-              }),
+            const { exitCode: inspectExit, stderr: inspectStderr } = yield* legacyChildResult(
+              child,
+              { stderr: true },
             ).pipe(
-              Effect.mapError(
-                () =>
-                  new LegacyDeclarativeShadowDbError({
-                    message: "failed to inspect service",
-                    docker: "daemon",
-                  }),
-              ),
-            );
-            const inspectExit = yield* child.exitCode.pipe(
-              Effect.map(Number),
               Effect.mapError(
                 () =>
                   new LegacyDeclarativeShadowDbError({
@@ -194,20 +171,7 @@ export const legacyDeclarativeSeamLayer = Layer.effect(
             );
             if (inspectExit === 0) return; // already running
 
-            const stderr = new TextDecoder()
-              .decode(
-                (() => {
-                  const total = stderrChunks.reduce((s, c) => s + c.length, 0);
-                  const bytes = new Uint8Array(total);
-                  let offset = 0;
-                  for (const c of stderrChunks) {
-                    bytes.set(c, offset);
-                    offset += c.length;
-                  }
-                  return bytes;
-                })(),
-              )
-              .trim();
+            const stderr = inspectStderr.trim();
             // Only a missing container means "not running" → start it. Docker reports
             // this as either "No such container" or "No such object" (the same pair
             // handled in `shared/functions/serve.ts`). Any other inspect failure (e.g.
@@ -308,13 +272,7 @@ export const legacyDeclarativeSeamLayer = Layer.effect(
                   }),
               ),
             );
-            const stdoutChunks: Array<Uint8Array> = [];
-            const stderrChunks: Array<Uint8Array> = [];
-            yield* Stream.runForEach(child.stdout, (chunk) =>
-              Effect.sync(() => {
-                stdoutChunks.push(chunk);
-              }),
-            ).pipe(
+            const result = yield* legacyChildResult(child, { stdout: true, stderr: true }).pipe(
               Effect.mapError(
                 () =>
                   new LegacyDeclarativeShadowDbError({
@@ -323,41 +281,9 @@ export const legacyDeclarativeSeamLayer = Layer.effect(
                   }),
               ),
             );
-            yield* Stream.runForEach(child.stderr, (chunk) =>
-              Effect.sync(() => {
-                stderrChunks.push(chunk);
-              }),
-            ).pipe(
-              Effect.mapError(
-                () =>
-                  new LegacyDeclarativeShadowDbError({
-                    message: "failed to inspect local Postgres container.",
-                    docker: "daemon",
-                  }),
-              ),
-            );
-            const inspectExit = yield* child.exitCode.pipe(
-              Effect.map(Number),
-              Effect.mapError(
-                () =>
-                  new LegacyDeclarativeShadowDbError({
-                    message: "failed to inspect local Postgres container.",
-                    docker: "daemon",
-                  }),
-              ),
-            );
-            const decodeChunks = (chunks: ReadonlyArray<Uint8Array>): string => {
-              const total = chunks.reduce((size, chunk) => size + chunk.length, 0);
-              const bytes = new Uint8Array(total);
-              let offset = 0;
-              for (const chunk of chunks) {
-                bytes.set(chunk, offset);
-                offset += chunk.length;
-              }
-              return new TextDecoder().decode(bytes).trim();
-            };
-            const stderr = decodeChunks(stderrChunks);
-            const stdout = decodeChunks(stdoutChunks);
+            const inspectExit = result.exitCode;
+            const stderr = result.stderr.trim();
+            const stdout = result.stdout.trim();
             if (inspectExit !== 0) {
               if (legacyIsMissingContainerInspectError(stderr)) return;
               return yield* Effect.fail(

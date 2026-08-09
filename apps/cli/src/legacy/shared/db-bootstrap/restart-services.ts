@@ -19,7 +19,7 @@ import {
 } from "../../../shared/telemetry/error-actionability.ts";
 import { legacyAqua } from "../legacy-colors.ts";
 import {
-  collectText,
+  legacyChildResult,
   legacyDescribeContainerCliFailure,
   legacyIsContainerNotFoundMessage,
   runContainerCliExpectSuccess,
@@ -79,10 +79,7 @@ const legacyRestartSatelliteService = (
         stdout: "ignore",
         stderr: "pipe",
       });
-      const [exitCode, stderr] = yield* Effect.all(
-        [child.exitCode.pipe(Effect.map(Number)), collectText(child.stderr)],
-        { concurrency: "unbounded" },
-      );
+      const { exitCode, stderr } = yield* legacyChildResult(child, { stderr: true });
       if (exitCode === 0) return Option.none();
       const trimmed = stderr.trim();
       if (legacyIsContainerNotFoundMessage(trimmed)) return Option.none();
@@ -178,14 +175,10 @@ function legacyExecCaptureCombined(
         stdout: "pipe",
         stderr: "pipe",
       });
-      const [exitCode, stdout, stderr] = yield* Effect.all(
-        [
-          child.exitCode.pipe(Effect.map(Number)),
-          collectText(child.stdout),
-          collectText(child.stderr),
-        ],
-        { concurrency: "unbounded" },
-      );
+      const { exitCode, stdout, stderr } = yield* legacyChildResult(child, {
+        stdout: true,
+        stderr: true,
+      });
       return { exitCode, output: stdout + stderr };
     }),
   ).pipe(
