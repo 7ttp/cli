@@ -1,4 +1,4 @@
-import { Data, Effect, type FileSystem, Option, type Path, Stream } from "effect";
+import { Data, Duration, Effect, Fiber, type FileSystem, Option, type Path, Stream } from "effect";
 import type { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
 
 import {
@@ -111,16 +111,20 @@ export function legacyIsLocalDbRunning(
             }),
         ),
       );
+      // The `legacyChildResult` (`../legacy-container-cli.ts`) shape inlined,
+      // minus its unconditional post-exit grace: stderr here is failure-path
+      // enrichment only (the exit code alone decides "running"), so a zero
+      // exit returns immediately without waiting on the stream at all —
+      // keeping this hot per-invocation probe instant even when the pipe is
+      // held open (supabase/cli#6110). A drain failure just degrades to the
+      // text gathered so far; the grace collects whatever the CLI flushed by
+      // the time it elapses.
       const stderrChunks: Array<Uint8Array> = [];
-      yield* Stream.runForEach(child.stderr, (chunk) =>
+      const stderrDrain = yield* Stream.runForEach(child.stderr, (chunk: Uint8Array) =>
         Effect.sync(() => {
           stderrChunks.push(chunk);
         }),
-      ).pipe(
-        Effect.mapError(
-          () => new LegacyLocalDbRunningError({ message: "failed to inspect service" }),
-        ),
-      );
+      ).pipe(Effect.forkScoped({ startImmediately: true }));
       const inspectExit = yield* child.exitCode.pipe(
         Effect.map(Number),
         Effect.mapError(
@@ -129,6 +133,8 @@ export function legacyIsLocalDbRunning(
       );
       if (inspectExit === 0) return true; // container exists ⇒ running
 
+      yield* Fiber.await(stderrDrain).pipe(Effect.timeoutOption(Duration.seconds(2)));
+      yield* Fiber.interrupt(stderrDrain);
       const stderr = decodeChunks(stderrChunks).trim();
       // Only a missing container means "not running". Any other inspect
       // failure propagates, matching Go's `AssertSupabaseDbIsRunning`. Uses the
