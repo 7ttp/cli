@@ -1,0 +1,52 @@
+name: win-spawn-repro-6110
+
+on:
+  push:
+    branches: [repro/win-spawn-6110]
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.13"
+      - name: Install harness deps
+        shell: bash
+        run: |
+          mkdir -p /c/repro && cd /c/repro
+          cp "$GITHUB_WORKSPACE/scratch-repro/win-spawn-repro.ts" .
+          bun add effect@4.0.0-beta.103 @effect/platform-bun@4.0.0-beta.103
+      - name: Run cases (plain bun)
+        shell: bash
+        run: |
+          cd /c/repro
+          docker version || true
+          for c in exit0-bare exit1-bare exit1-stderr-seq exit1-grandchild-seq exit1-grandchild-conc exit1-grandchild-fix docker-inspect-seq docker-inspect-fix; do
+            echo "=== CASE $c (bun) ==="
+            SECONDS=0
+            if timeout 15 bun win-spawn-repro.ts "$c"; then
+              echo "--- $c: COMPLETED in ${SECONDS}s"
+            else
+              rc=$?
+              if [ "$rc" = "124" ]; then echo "--- $c: HANG (killed after 15s)"; else echo "--- $c: exited rc=$rc after ${SECONDS}s"; fi
+            fi
+          done
+      - name: Run cases (compiled binary)
+        shell: bash
+        run: |
+          cd /c/repro
+          bun build win-spawn-repro.ts --compile --outfile repro.exe
+          for c in exit0-bare exit1-bare exit1-stderr-seq exit1-grandchild-seq exit1-grandchild-conc exit1-grandchild-fix docker-inspect-seq docker-inspect-fix; do
+            echo "=== CASE $c (compiled) ==="
+            SECONDS=0
+            if timeout 15 ./repro.exe "$c"; then
+              echo "--- $c: COMPLETED in ${SECONDS}s"
+            else
+              rc=$?
+              if [ "$rc" = "124" ]; then echo "--- $c: HANG (killed after 15s)"; else echo "--- $c: exited rc=$rc after ${SECONDS}s"; fi
+            fi
+          done
