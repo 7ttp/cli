@@ -13,14 +13,14 @@ import {
   loadProjectConfig,
   type ResolvedFunctionConfig as ManifestFunctionConfig,
 } from "@supabase/config";
-import { Duration, Effect, Option, Schema, Stream } from "effect";
+import { Duration, Effect, Option, Schema } from "effect";
 import * as HttpBody from "effect/unstable/http/HttpBody";
 import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { legacyPromptYesNo } from "../legacy/legacy-prompt-yes-no.ts";
 import { CONTEXT_CANCELED_MESSAGE } from "../output/errors.ts";
 import { Output } from "../output/output.service.ts";
-import { spawnContainerCli } from "../../legacy/shared/legacy-container-cli.ts";
+import { legacyChildResult, spawnContainerCli } from "../../legacy/shared/legacy-container-cli.ts";
 import { legacyBold } from "../../legacy/shared/legacy-colors.ts";
 import { legacyGetRegistryImageUrl } from "../../legacy/shared/legacy-docker-registry.ts";
 import { findGitRootPath } from "../git/git-root.ts";
@@ -1140,15 +1140,6 @@ function createBundledMetadata(
   };
 }
 
-function collectByteStream(stream: Stream.Stream<Uint8Array, unknown>) {
-  const decoder = new TextDecoder();
-  return Stream.runFold(
-    stream,
-    () => "",
-    (text, chunk) => text + decoder.decode(chunk, { stream: true }),
-  ).pipe(Effect.map((text) => text + decoder.decode()));
-}
-
 function sanitizeDockerBinds(
   binds: ReadonlyArray<string>,
   functionsDir: string,
@@ -1407,15 +1398,10 @@ export const runChildProcess = Effect.fnUntraced(function* (
     extendEnv: opts.extendEnv ?? command === "docker",
   });
 
-  const [stdout, stderr, exitCode] = yield* Effect.all(
-    [
-      opts.stdout === "ignore" ? Effect.succeed("") : collectByteStream(child.stdout),
-      opts.stderr === "ignore" ? Effect.succeed("") : collectByteStream(child.stderr),
-      child.exitCode.pipe(Effect.map(Number)),
-    ],
-    { concurrency: "unbounded" },
-  );
-  return { exitCode, stdout, stderr };
+  return yield* legacyChildResult(child, {
+    stdout: opts.stdout !== "ignore",
+    stderr: opts.stderr !== "ignore",
+  });
 });
 
 const isDockerRunning = Effect.fnUntraced(function* () {

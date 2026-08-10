@@ -288,20 +288,27 @@ function legacyStreamContainerLogsOnce(
       });
       runtime = spawned.runtime;
       const handle = spawned.handle;
-      yield* legacyGateOnExitCode(handle.exitCode, [
-        Stream.runForEach(handle.stdout, (chunk) =>
-          Effect.sync(() => {
-            globalThis.process.stderr.write(chunk);
-            stdoutScanner.scan(chunk);
-          }),
-        ),
-        Stream.runForEach(handle.stderr, (chunk) =>
-          Effect.sync(() => {
-            globalThis.process.stderr.write(chunk);
-            stderrScanner.scan(chunk);
-          }),
-        ),
-      ]);
+      let written = 0;
+      yield* legacyGateOnExitCode(
+        handle,
+        [
+          Stream.runForEach(handle.stdout, (chunk) =>
+            Effect.sync(() => {
+              written += 1;
+              globalThis.process.stderr.write(chunk);
+              stdoutScanner.scan(chunk);
+            }),
+          ),
+          Stream.runForEach(handle.stderr, (chunk) =>
+            Effect.sync(() => {
+              written += 1;
+              globalThis.process.stderr.write(chunk);
+              stderrScanner.scan(chunk);
+            }),
+          ),
+        ],
+        () => written,
+      );
     }),
   ).pipe(
     Effect.orElseSucceed(() => undefined),

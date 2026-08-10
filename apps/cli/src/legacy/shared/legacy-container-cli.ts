@@ -1,9 +1,19 @@
-import { Data, Duration, Effect, type Exit, Fiber, type Scope, Stream } from "effect";
+import {
+  Cause,
+  Data,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Option,
+  type PlatformError,
+  type Scope,
+  Stream,
+} from "effect";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import {
   type ChildProcessHandle,
   ChildProcessSpawner,
-  type ExitCode,
 } from "effect/unstable/process/ChildProcessSpawner";
 
 import {
@@ -138,12 +148,14 @@ export const containerCliExitCode = (
   );
 
 /**
- * How long {@link legacyGateOnExitCode} keeps its drains running AFTER the
- * child's exit code has resolved. Anything the CLI wrote before exiting is
- * already buffered and arrives within milliseconds; the bound only cuts off
- * waiting for an EOF that may never come (see below).
+ * How long {@link legacyGateOnExitCode} lets its drains keep running AFTER the
+ * child's exit code has resolved while they make no progress. Anything the CLI
+ * wrote before exiting is already buffered and arrives within milliseconds; the
+ * bound only cuts off waiting for an EOF that may never come (see below). A
+ * drain still receiving data keeps its window sliding, so output is never cut
+ * off mid-flow — only after a full slice of silence.
  */
-const LEGACY_CHILD_OUTPUT_GRACE = Duration.seconds(2);
+const LEGACY_CHILD_OUTPUT_IDLE = Duration.millis(200);
 
 /**
  * Awaits a spawned child's exit code while running the given output-stream
@@ -155,40 +167,85 @@ const LEGACY_CHILD_OUTPUT_GRACE = Duration.seconds(2);
  *   `docker.exe` (Docker Desktop) can leave a helper process holding the
  *   inherited stdio handle open past its own exit, so EOF never arrives and
  *   the command parks forever with no output (supabase/cli#6110). This gates
- *   on the exit code alone and gives the drains a bounded post-exit grace
- *   ({@link LEGACY_CHILD_OUTPUT_GRACE}), so a held-open pipe costs at most
- *   that grace instead of hanging.
+ *   on the exit code alone and cuts drains off once they go idle for
+ *   {@link LEGACY_CHILD_OUTPUT_IDLE} after exit — a held-open pipe costs one
+ *   idle slice instead of hanging, while a drain still receiving data is
+ *   never cut off mid-flow (`activity` must report a monotonic progress
+ *   counter, e.g. chunks or bytes consumed).
  * - Awaiting the exit code FIRST and only then subscribing loses output:
  *   Node's "exit" event can fire before a fast child's pipes are drained, so
  *   a late subscriber sees an already-ended, empty stream. Drains are forked
  *   immediately (`startImmediately`), before the exit-code await.
  *
- * The exit code is authoritative; drained output is classification/reporting
- * enrichment, so a drain that fails mid-stream (or is cut off by the grace)
- * degrades to whatever it captured rather than failing the call. Callers
- * whose drain failures ARE load-bearing (e.g. a caller-supplied sink) get the
- * settled per-drain `Exit`s back, in input order, to re-raise from.
+ * A drain that fails while the child is still running stops consuming its
+ * pipe, which can block the child on a full buffer and park the exit-code
+ * await forever — so the await races against drain failure and kills the
+ * child when a drain fails first. The exit code is authoritative; drained
+ * output is classification/reporting enrichment, so a drain failure degrades
+ * to whatever it captured rather than failing the call. Callers whose drain
+ * failures ARE load-bearing (e.g. a caller-supplied sink) capture the typed
+ * cause out-of-band via {@link legacySinkCauseCapture} and re-raise it after
+ * the gate returns.
  */
-export function legacyGateOnExitCode<E>(
-  exitCode: Effect.Effect<ExitCode, E>,
+export function legacyGateOnExitCode(
+  child: ChildProcessHandle,
   drains: ReadonlyArray<Effect.Effect<void, unknown>>,
-): Effect.Effect<
-  { exitCode: number; drainExits: ReadonlyArray<Exit.Exit<void, unknown>> },
-  E,
-  Scope.Scope
-> {
+  activity: () => number,
+): Effect.Effect<{ exitCode: number }, PlatformError.PlatformError, Scope.Scope> {
   return Effect.gen(function* () {
     const fibers = yield* Effect.all(
       drains.map((drain) => drain.pipe(Effect.forkScoped({ startImmediately: true }))),
     );
-    const code = yield* exitCode.pipe(Effect.map(Number));
-    yield* Effect.all(fibers.map(Fiber.await), { concurrency: "unbounded" }).pipe(
-      Effect.timeoutOption(LEGACY_CHILD_OUTPUT_GRACE),
+    const drainFailure = Effect.raceAll(
+      fibers.map((fiber) =>
+        Fiber.await(fiber).pipe(
+          Effect.flatMap((exit) =>
+            Exit.isFailure(exit) && !Cause.hasInterrupts(exit.cause) ? Effect.void : Effect.never,
+          ),
+        ),
+      ),
     );
+    const code = yield* Effect.raceFirst(
+      child.exitCode,
+      drainFailure.pipe(
+        Effect.andThen(child.kill().pipe(Effect.ignore)),
+        Effect.andThen(child.exitCode),
+      ),
+    ).pipe(Effect.map(Number));
+    let last = activity();
+    while (true) {
+      const settled = yield* Effect.all(fibers.map(Fiber.await), {
+        concurrency: "unbounded",
+      }).pipe(Effect.timeoutOption(LEGACY_CHILD_OUTPUT_IDLE));
+      if (Option.isSome(settled)) break;
+      const now = activity();
+      if (now === last) break;
+      last = now;
+    }
     yield* Effect.all(fibers.map(Fiber.interrupt), { concurrency: "unbounded" });
-    const drainExits = yield* Effect.all(fibers.map(Fiber.await), { concurrency: "unbounded" });
-    return { exitCode: code, drainExits };
+    return { exitCode: code };
   });
+}
+
+/**
+ * Out-of-band capture for a load-bearing drain's typed failure cause, shared
+ * by every {@link legacyGateOnExitCode} caller whose sink failure must abort
+ * the command (a payload writer, not enrichment): pipe the drain through
+ * `Effect.tapCause(capture.tap)` and re-raise `capture.cause` after the gate.
+ * Interruptions (the post-exit idle cutoff of a held-open pipe) are not sink
+ * failures and are ignored.
+ */
+export function legacySinkCauseCapture<E>() {
+  let cause: Cause.Cause<E> | undefined;
+  return {
+    tap: (c: Cause.Cause<E>) =>
+      Effect.sync(() => {
+        if (!Cause.hasInterrupts(c) && cause === undefined) cause = c;
+      }),
+    get cause() {
+      return cause;
+    },
+  };
 }
 
 /**
@@ -218,8 +275,9 @@ export function legacyChildResult(
       };
     });
     const { exitCode } = yield* legacyGateOnExitCode(
-      child.exitCode,
+      child,
       collectors.map(({ drain }) => drain),
+      () => collectors.reduce((total, { chunks }) => total + chunks.length, 0),
     );
     const [stdout, stderr] = collectors.map(({ chunks }) => legacyDecodeChunks(chunks));
     return { exitCode, stdout: stdout ?? "", stderr: stderr ?? "" };

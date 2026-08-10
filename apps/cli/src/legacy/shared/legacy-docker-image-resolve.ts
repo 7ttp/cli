@@ -155,10 +155,14 @@ export function legacyMakeDockerImageResolver(
           globalThis.process.stderr.write(chunk);
           if (chunk.length > 0) endedWithNewline = chunk[chunk.length - 1] === 0x0a;
         });
-      const { exitCode } = yield* legacyGateOnExitCode(handle.exitCode, [
-        Stream.runForEach(handle.stdout, teeInto(stdoutChunks)),
-        Stream.runForEach(handle.stderr, teeInto(stderrChunks)),
-      ]);
+      const { exitCode } = yield* legacyGateOnExitCode(
+        handle,
+        [
+          Stream.runForEach(handle.stdout, teeInto(stdoutChunks)),
+          Stream.runForEach(handle.stderr, teeInto(stderrChunks)),
+        ],
+        () => stdoutChunks.length + stderrChunks.length,
+      );
       const stdout = legacyDecodeChunks(stdoutChunks);
       const stderr = legacyDecodeChunks(stderrChunks);
       return {

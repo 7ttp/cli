@@ -1,4 +1,4 @@
-import { Data, Duration, Effect, Fiber, type FileSystem, Option, type Path, Stream } from "effect";
+import { Data, Effect, type FileSystem, Option, type Path } from "effect";
 import type { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
 
 import {
@@ -6,7 +6,11 @@ import {
   type CliErrorActionabilityDeclaration,
   ErrorActionabilityId,
 } from "../../../shared/telemetry/error-actionability.ts";
-import { legacyIsContainerNotFoundMessage, spawnContainerCli } from "../legacy-container-cli.ts";
+import {
+  legacyChildResult,
+  legacyIsContainerNotFoundMessage,
+  spawnContainerCli,
+} from "../legacy-container-cli.ts";
 import { legacyReadDbToml } from "../legacy-db-config.toml-read.ts";
 import { legacyResolveLocalProjectId, localDbContainerId } from "../legacy-docker-ids.ts";
 import {
@@ -31,17 +35,6 @@ export class LegacyLocalDbRunningError extends Data.TaggedError("LegacyLocalDbRu
     return actionability.startStack;
   }
 }
-
-const decodeChunks = (chunks: ReadonlyArray<Uint8Array>): string => {
-  const total = chunks.reduce((size, chunk) => size + chunk.length, 0);
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return new TextDecoder().decode(bytes);
-};
 
 /**
  * Port of Go's `utils.AssertSupabaseDbIsRunning` (`internal/utils/misc.go:144`):
@@ -111,31 +104,16 @@ export function legacyIsLocalDbRunning(
             }),
         ),
       );
-      // The `legacyChildResult` (`../legacy-container-cli.ts`) shape inlined,
-      // minus its unconditional post-exit grace: stderr here is failure-path
-      // enrichment only (the exit code alone decides "running"), so a zero
-      // exit returns immediately without waiting on the stream at all —
-      // keeping this hot per-invocation probe instant even when the pipe is
-      // held open (supabase/cli#6110). A drain failure just degrades to the
-      // text gathered so far; the grace collects whatever the CLI flushed by
-      // the time it elapses.
-      const stderrChunks: Array<Uint8Array> = [];
-      const stderrDrain = yield* Stream.runForEach(child.stderr, (chunk: Uint8Array) =>
-        Effect.sync(() => {
-          stderrChunks.push(chunk);
-        }),
-      ).pipe(Effect.forkScoped({ startImmediately: true }));
-      const inspectExit = yield* child.exitCode.pipe(
-        Effect.map(Number),
+      const { exitCode: inspectExit, stderr: inspectStderr } = yield* legacyChildResult(child, {
+        stderr: true,
+      }).pipe(
         Effect.mapError(
           () => new LegacyLocalDbRunningError({ message: "failed to inspect service" }),
         ),
       );
       if (inspectExit === 0) return true; // container exists ⇒ running
 
-      yield* Fiber.await(stderrDrain).pipe(Effect.timeoutOption(Duration.seconds(2)));
-      yield* Fiber.interrupt(stderrDrain);
-      const stderr = decodeChunks(stderrChunks).trim();
+      const stderr = inspectStderr.trim();
       // Only a missing container means "not running". Any other inspect
       // failure propagates, matching Go's `AssertSupabaseDbIsRunning`. Uses the
       // shared, Podman-aware matcher (`legacyIsContainerNotFoundMessage`) rather than a
