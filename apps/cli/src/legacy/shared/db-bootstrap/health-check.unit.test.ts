@@ -8,6 +8,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   LegacyHealthCheckTimeoutError,
+  legacyResolveStackHealthTimeoutSeconds,
   legacyWaitForHealthyServices,
   type LegacyHealthCheckPostgrestGateway,
 } from "./health-check.ts";
@@ -149,6 +150,24 @@ const unusedHttpClientLayer = Layer.succeed(
   HttpClient.HttpClient,
   HttpClient.make(() => Effect.die("HttpClient should not be called for a plain container check")),
 );
+
+describe("legacyResolveStackHealthTimeoutSeconds", () => {
+  it("gives the stack the configured db.health_timeout when it exceeds Go's 30s", () => {
+    // The default `2m`, and the whole point of supabase/cli#6112: Docker calls a
+    // still-booting container `unhealthy` at ~30s, so a wait that also stopped
+    // at 30s could never tell "not ready yet" from "broken".
+    expect(legacyResolveStackHealthTimeoutSeconds(120)).toBe(120);
+    expect(legacyResolveStackHealthTimeoutSeconds(31)).toBe(31);
+  });
+
+  it("floors at Go's 30s so a lowered db.health_timeout cannot shrink the stack's budget", () => {
+    // `db.health_timeout` is Postgres-scoped, so a project that lowered it must
+    // not thereby hand the other twelve containers less than Go ever gave them.
+    expect(legacyResolveStackHealthTimeoutSeconds(10)).toBe(30);
+    expect(legacyResolveStackHealthTimeoutSeconds(0)).toBe(30);
+    expect(legacyResolveStackHealthTimeoutSeconds(30)).toBe(30);
+  });
+});
 
 describe("legacyWaitForHealthyServices", () => {
   it.effect(

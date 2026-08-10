@@ -1392,7 +1392,7 @@ describe("legacy db diff", () => {
       // declarative-apply) as `acquireUseRelease`'s `acquire`, which Effect's
       // `uninterruptibleMask` (no `restore` around `acquire`) made completely
       // uninterruptible — a SIGINT landing during the health wait (which can run for
-      // up to 30 real seconds, `LEGACY_HEALTH_CHECK_TIMEOUT_SECONDS`) was silently
+      // up to 30 real seconds, this caller's own `timeoutSeconds`) was silently
       // swallowed until the health check gave up on its own, unlike Go's single
       // cancellable `ctx`. `acquire` is now ONLY `legacyCreateShadowDatabase`
       // (container creation); the health wait runs inside the interruptible `use`

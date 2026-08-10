@@ -667,7 +667,7 @@ describe("legacy db start", () => {
   });
 
   it.live("a health-check timeout without --from-backup fails the command and rolls back", () => {
-    // `db.health_timeout` (unlike the generic 30s `serviceTimeout` every other service waits on)
+    // `db.health_timeout` (which the other services' own wait now shares, floored at Go's 30s)
     // is a real config.toml-configurable seam — this keeps the scenario fast instead of waiting
     // out the real 2m default.
     const { layer, child } = setup({

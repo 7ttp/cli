@@ -179,6 +179,15 @@ function mockStartContainerCliSpawner(
   };
 }
 
+/**
+ * Pins the stack health wait to its 30s floor (`legacyResolveStackHealthTimeoutSeconds`)
+ * rather than the `2m` default, for the scenarios that deliberately never turn a container
+ * healthy and so must sit out the whole budget in real time. 30s is what these tests were
+ * written against when Go's `serviceTimeout` was the budget, so their real-time cost is
+ * unchanged; without this they would each wait out the full default instead.
+ */
+const SHORT_HEALTH_TIMEOUT_CONFIG = 'project_id = "demo"\n[db]\nhealth_timeout = "1s"\n';
+
 const HEALTHY_STATE = '{"Running":true,"Status":"running","Health":{"Status":"healthy"}}';
 const STARTING_STATE = '{"Running":true,"Status":"running","Health":{"Status":"starting"}}';
 const STOPPED_STATE = '{"Running":false,"Status":"exited"}';
@@ -3305,7 +3314,7 @@ content_path = "./templates/custom_notice.html"
     it.live(
       "fails and rolls back when Postgres itself never becomes healthy within its configured health_timeout",
       () => {
-        // `db.health_timeout` (unlike the generic 30s `serviceTimeout` every other service
+        // `db.health_timeout` (which the other services' own wait now shares, floored at Go's 30s)
         // waits on) is a real config.toml-configurable seam — this keeps the scenario fast
         // instead of waiting out a real default.
         const neverHealthy = new Set<string>();
@@ -3392,15 +3401,16 @@ content_path = "./templates/custom_notice.html"
     // scenario below — `legacyStart` performs genuine async I/O that never resolves under a
     // virtualized clock. Unlike Postgres's own wait above, this second bulk health check has no
     // config-configurable timeout seam in `start.handler.ts` (`legacyWaitForHealthyServices`
-    // is called with no `timeoutSeconds` override, so it falls back to the hardcoded 30s
-    // default) — there is no way to shorten this without editing production code, which is out
-    // of scope for this task, so this reuses the same generous real-time budget instead.
+    // is passed `legacyResolveStackHealthTimeoutSeconds`, whose floor holds this at Go's 30s
+    // for a default `db.health_timeout`) — there is no way to shorten it below that floor, so
+    // this reuses the same generous real-time budget instead.
     it.live(
       "fails and rolls back when a non-Postgres service never becomes healthy within the timeout (no --ignore-health-check)",
       () => {
         const neverHealthy = new Set<string>();
         const route = defaultRoute({ neverHealthy });
         const { layer, out, child } = setup({
+          configContents: SHORT_HEALTH_TIMEOUT_CONFIG,
           route: (args) => {
             if (args[0] === "create") {
               const name = containerNameFromCreateArgs(args);
@@ -3428,6 +3438,44 @@ content_path = "./templates/custom_notice.html"
       },
       45_000,
     );
+
+    // The reason this PR exists: every OTHER health scenario pins
+    // `health_timeout` low and so lands on the 30s floor, which a hardcoded 30
+    // would satisfy just as well. This one raises it ABOVE the floor and shows
+    // the wait genuinely follows it, which is what lets a container that Docker
+    // called `unhealthy` at ~30s still be seen recovering (supabase/cli#6112).
+    it.live(
+      "keeps waiting past Go's 30s when db.health_timeout is raised above the floor",
+      () => {
+        const neverHealthy = new Set<string>();
+        const route = defaultRoute({ neverHealthy });
+        const { layer, child } = setup({
+          configContents: 'project_id = "demo"\n[db]\nhealth_timeout = "45s"\n',
+          route: (args) => {
+            if (args[0] === "create") {
+              const name = containerNameFromCreateArgs(args);
+              if (name.includes("_auth_")) neverHealthy.add(name);
+            }
+            return route(args);
+          },
+          httpClientLayer: unusedHttpClientLayer,
+        });
+
+        return Effect.gen(function* () {
+          const startedAt = Date.now();
+          const exit = yield* Effect.exit(
+            legacyStart(flags({ exclude: ["postgrest", "edge-runtime"] })),
+          );
+          const elapsedSeconds = (Date.now() - startedAt) / 1000;
+          expect(Exit.isFailure(exit)).toBe(true);
+          // Comfortably past the 30s floor a hardcoded budget would have stopped
+          // at, and short of the 45s it was actually given.
+          expect(elapsedSeconds).toBeGreaterThan(35);
+          expect(rollbackWasAttempted(child.spawned)).toBe(true);
+        }).pipe(Effect.provide(layer));
+      },
+      90_000,
+    );
   });
 
   // Real time, not `it.effect`/`TestClock`: `legacyStart` performs genuine
@@ -3435,8 +3483,8 @@ content_path = "./templates/custom_notice.html"
   // `Effect.tryPromise`, `legacyResolveDbImage`'s file read) that needs real
   // Node event-loop turns to settle — under a virtualized `TestClock` those
   // never resolve, so the forked fiber never even reaches the health-check
-  // phase. This exercises the real 30s `serviceTimeout` bulk health-check
-  // wait (`../../shared/db-bootstrap/health-check.ts`'s default), hence the generous timeout.
+  // phase. This exercises the real bulk health-check wait
+  // (`../../shared/db-bootstrap/health-check.ts`'s 30s floor), hence the generous timeout.
   it.live(
     "exits 0 on --ignore-health-check when a non-Postgres container never turns healthy, without rolling back",
     () => {
@@ -3447,6 +3495,7 @@ content_path = "./templates/custom_notice.html"
       const neverHealthy = new Set<string>();
       const route = defaultRoute({ neverHealthy });
       const { layer, out, child, analytics } = setup({
+        configContents: SHORT_HEALTH_TIMEOUT_CONFIG,
         route: (args) => {
           if (args[0] === "create") {
             const name = containerNameFromCreateArgs(args);
@@ -3494,7 +3543,7 @@ content_path = "./templates/custom_notice.html"
         const neverHealthy = new Set<string>();
         const route = freshVolumeRoute(defaultRoute({ neverHealthy }));
         const { layer, out, child, analytics } = setup({
-          configContents: 'project_id = "demo"\n[storage.buckets.avatars]\npublic = false\n',
+          configContents: `${SHORT_HEALTH_TIMEOUT_CONFIG}[storage.buckets.avatars]\npublic = false\n`,
           route: (args) => {
             if (args[0] === "create") {
               const name = containerNameFromCreateArgs(args);
@@ -3556,7 +3605,7 @@ content_path = "./templates/custom_notice.html"
         const neverHealthy = new Set<string>();
         const route = freshVolumeRoute(defaultRoute({ neverHealthy }));
         const { layer, child, analytics } = setup({
-          configContents: 'project_id = "demo"\n[storage.buckets.avatars]\npublic = false\n',
+          configContents: `${SHORT_HEALTH_TIMEOUT_CONFIG}[storage.buckets.avatars]\npublic = false\n`,
           route: (args) => {
             if (args[0] === "create") {
               const name = containerNameFromCreateArgs(args);
@@ -3595,7 +3644,7 @@ content_path = "./templates/custom_notice.html"
         const route = freshVolumeRoute(defaultRoute({ neverHealthy }));
         const http = mockStorageBucketHttpClient();
         const { layer, out, child, analytics } = setup({
-          configContents: 'project_id = "demo"\n[storage.buckets.avatars]\npublic = false\n',
+          configContents: `${SHORT_HEALTH_TIMEOUT_CONFIG}[storage.buckets.avatars]\npublic = false\n`,
           route: (args) => {
             if (args[0] === "create") {
               const name = containerNameFromCreateArgs(args);

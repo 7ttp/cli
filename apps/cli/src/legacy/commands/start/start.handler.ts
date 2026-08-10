@@ -147,6 +147,7 @@ import {
 } from "../../shared/db-bootstrap/container-lifecycle.ts";
 import { legacyEnsureImagesCached } from "../../shared/db-bootstrap/image-prepull.ts";
 import {
+  legacyResolveStackHealthTimeoutSeconds,
   legacyWaitForHealthyServices,
   type LegacyHealthCheckPostgrestGateway,
   type LegacyHealthCheckTimeoutError,
@@ -1947,8 +1948,14 @@ export const legacyStart = Effect.fn("legacy.start")(function* (flags: LegacySta
       // required), so every fail path below just fails and lets this single
       // outer `onError` roll back.
       yield* Effect.gen(function* () {
-        // 9. Bulk health check over every non-Postgres started container, at the
-        // generic 30s `serviceTimeout` (`start.go:161,1270-1271`).
+        // 9. Bulk health check over every non-Postgres started container
+        // (`start.go:161,1270-1271`). Go gave this its own hardcoded 30s
+        // `serviceTimeout`; it now runs on `db.health_timeout` floored at that
+        // same 30s — see `legacyResolveStackHealthTimeoutSeconds`. Worst case
+        // this wait and the `--ignore-health-check` storage recheck below run
+        // back to back, so a stack that never comes up takes twice the budget
+        // to say so: 4m at the default `db.health_timeout`, where Go took 60s,
+        // and longer still for a project that raised it.
         if (output.format === "text") {
           yield* output.raw(LEGACY_START_WAITING_FOR_HEALTH_CHECKS_MESSAGE, "stderr");
         }
@@ -2034,6 +2041,7 @@ export const legacyStart = Effect.fn("legacy.start")(function* (flags: LegacySta
           config: effectiveLocalStorageConfig,
         });
         const healthResult = yield* legacyWaitForHealthyServices(spawner, [...started.keys()], {
+          timeoutSeconds: legacyResolveStackHealthTimeoutSeconds(dbHealthTimeoutSeconds),
           postgrest: postgrestGateway,
           edgeRuntime: edgeRuntimeGateway,
           images: started,
@@ -2066,7 +2074,10 @@ export const legacyStart = Effect.fn("legacy.start")(function* (flags: LegacySta
               const storageHealthResult = yield* legacyWaitForHealthyServices(
                 spawner,
                 [storageContainerId],
-                { images: started },
+                {
+                  timeoutSeconds: legacyResolveStackHealthTimeoutSeconds(dbHealthTimeoutSeconds),
+                  images: started,
+                },
               ).pipe(Effect.result);
               if (Result.isSuccess(storageHealthResult)) {
                 const seedResult = yield* legacySeedBucketsRun({

@@ -3,8 +3,9 @@
  * (`apps/cli-go/internal/db/start/start.go:192-231`,
  * `apps/cli-go/internal/status/status.go:147-168`): a single shared probe
  * across every still-unhealthy started container, on a 1-second constant
- * backoff, for up to `timeoutSeconds` retries (Go's default `serviceTimeout =
- * 30 * time.Second`) — NOT independent per-container timers. Each tick probes
+ * backoff, for up to `timeoutSeconds` retries (named by every caller; see
+ * {@link LegacyWaitForHealthyServicesOptions.timeoutSeconds}) — NOT independent
+ * per-container timers. Each tick probes
  * every still-unhealthy container, narrows the "still watching" set to just
  * the ones that failed this round (a healthy container stops being probed),
  * and only the final timeout's failures surface to the caller.
@@ -29,8 +30,35 @@ import { legacyKongAuthHeaders } from "../legacy-kong-auth.ts";
 
 type Spawner = ChildProcessSpawner["Service"];
 
-/** Go's `serviceTimeout` (`apps/cli-go/internal/start/start.go:161`). */
-const LEGACY_HEALTH_CHECK_TIMEOUT_SECONDS = 30;
+/**
+ * Go's `serviceTimeout` (`apps/cli-go/internal/start/start.go:161`), kept as the
+ * FLOOR under {@link legacyResolveStackHealthTimeoutSeconds} rather than as the
+ * budget itself. See that function for why the budget had to move at all.
+ */
+const LEGACY_GO_SERVICE_TIMEOUT_SECONDS = 30;
+
+/**
+ * The budget `supabase start` gives the whole local stack, from the already
+ * resolved `db.health_timeout` (default `2m`).
+ *
+ * Go hardcoded 30s for every non-Postgres service, which is exactly when Docker
+ * reaches its own `unhealthy` verdict for the stack's healthcheck cadence
+ * (`interval: 10s`, `retries: 3`, no start period). The two deadlines landed on
+ * the same instant, so a service needing a fourth probe failed `start`, and
+ * failed it carrying Docker's `unhealthy` — as though it were broken, when it
+ * goes healthy moments later (supabase/cli#6112). Rather than invent a new
+ * number, the wait borrows the one Go already reasoned about for exactly this
+ * question, the only health budget it bothered to make configurable.
+ *
+ * The floor is what keeps that borrowing safe. `db.health_timeout` is a
+ * Postgres-scoped knob, so a project that lowered it (`"10s"`, or the supported
+ * `"0s"`) must not thereby hand the other twelve containers a budget Go never
+ * would have. Taking the max means this can only ever wait longer than Go, never
+ * less.
+ */
+export function legacyResolveStackHealthTimeoutSeconds(dbHealthTimeoutSeconds: number): number {
+  return Math.max(dbHealthTimeoutSeconds, LEGACY_GO_SERVICE_TIMEOUT_SECONDS);
+}
 
 /**
  * Go's `healthProbeTimeout` (`apps/cli-go/internal/status/status.go:209`): caps
@@ -124,7 +152,7 @@ export class LegacyHealthCheckTimeoutError extends Data.TaggedError(
  * `legacyHttpClientLayer` provides — so a stack started with
  * `[api.tls] enabled = true` now gets a `legacyCheckHttpReady` probe that
  * trusts the local Kong CA instead of exhausting `legacyWaitForHealthyServices`'s
- * full 30s budget on a TLS verification failure.
+ * full budget on a TLS verification failure.
  */
 export interface LegacyHealthCheckPostgrestGateway {
   readonly containerId: string;
@@ -133,7 +161,18 @@ export interface LegacyHealthCheckPostgrestGateway {
 }
 
 export interface LegacyWaitForHealthyServicesOptions {
-  readonly timeoutSeconds?: number;
+  /**
+   * Required, with no fallback. Go hardcoded a 30s `serviceTimeout`
+   * (`apps/cli-go/internal/start/start.go:161`) for every non-Postgres service,
+   * which is exactly when Docker reaches its own `unhealthy` verdict for the
+   * stack's healthcheck cadence (`interval: 10s`, `retries: 3`, no start
+   * period). The two deadlines landed on the same instant, so a service needing
+   * a fourth probe failed `start` and failed it as though it were broken
+   * (supabase/cli#6112). Every caller now names a real budget instead:
+   * `start.handler.ts` passes {@link legacyResolveStackHealthTimeoutSeconds},
+   * and the Postgres/shadow/storage waits pass the value they already resolved.
+   */
+  readonly timeoutSeconds: number;
   readonly postgrest?: LegacyHealthCheckPostgrestGateway;
   /** See {@link LEGACY_EDGE_RUNTIME_READY_PATH}'s doc comment for why this reuses the same gateway shape as {@link postgrest}. */
   readonly edgeRuntime?: LegacyHealthCheckPostgrestGateway;
@@ -344,9 +383,9 @@ function legacyDumpContainerLogs(
 export function legacyWaitForHealthyServices(
   spawner: Spawner,
   containerIds: ReadonlyArray<string>,
-  opts: LegacyWaitForHealthyServicesOptions = {},
+  opts: LegacyWaitForHealthyServicesOptions,
 ): Effect.Effect<void, LegacyHealthCheckTimeoutError, HttpClient.HttpClient> {
-  const timeoutSeconds = opts.timeoutSeconds ?? LEGACY_HEALTH_CHECK_TIMEOUT_SECONDS;
+  const timeoutSeconds = opts.timeoutSeconds;
   const postgrest = opts.postgrest;
   const edgeRuntime = opts.edgeRuntime;
 

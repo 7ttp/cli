@@ -360,3 +360,17 @@ prose, not structured data.
 - Docker status `created` is not considered a recoverable stopped stack: the container and
   named volume are preserved because the volume may not have completed its first database
   initialization, and `start` reports the existing not-running status instead.
+- The whole-stack health wait runs on `db.health_timeout` (default `2m`) floored at Go's own
+  30s, not on Go's hardcoded 30s `serviceTimeout` — the single deliberate divergence behind
+  supabase/cli#6112. Go paired that 30s with a healthcheck of `interval: 10s`, `retries: 3`
+  and no start period, so Docker reached its `unhealthy` verdict at the same instant the wait
+  gave up: a service needing a fourth probe failed `start`, and failed it as though it were
+  broken, even though it went healthy moments later. Every healthcheck the CLI writes is
+  unchanged from Go; only the budget moved, onto the knob Go already used for exactly this
+  question when it bothered to make one configurable. The floor means the wait can only ever
+  be longer than Go's, never shorter, so lowering `health_timeout` for Postgres cannot shrink
+  the other containers' budget. `SUPABASE_DB_HEALTH_TIMEOUT` overrides it as it always did.
+  The `--ignore-health-check` storage recheck shares the same budget, so a stack that never
+  comes up can run two of them back to back before the warning: 4m at the default, where Go
+  took 60s, and longer for a project that raised `health_timeout`. That slower failure is the
+  cost of not calling a container broken before anything has waited long enough to know.
