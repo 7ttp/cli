@@ -137,6 +137,11 @@ vi.mock("../../../../shared/functions/deploy.ts", async () => {
   };
 });
 
+// Keep handler tests independent of source-only esbuild; bundling is covered separately.
+vi.mock("../../../../shared/functions/serve-main-bundler.ts", () => ({
+  bundleServeMainTemplate: () => Promise.resolve("Deno.serve(() => new Response())\n"),
+}));
+
 const tempRoot = useLegacyTempWorkdir("supabase-functions-serve-int-");
 
 // Root bypasses POSIX permission bits, so chmod-based failure tests can't run there.
