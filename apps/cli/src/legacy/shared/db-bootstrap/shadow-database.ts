@@ -264,10 +264,11 @@ export const legacyCreateShadowDatabase = (
     const spec = legacyBuildShadowPostgresContainerSpec(input);
     // The shadow container has no name (Docker auto-generates one) and no network alias —
     // see this module's own header for why that's still enough for the shadow's own one-shot
-    // setup jobs to reach it. The pgsodium root key itself (PG15+ only) never touches host
-    // disk at all — it's delivered straight into the container via `docker cp`
-    // ({@link LegacyStartContainerSpec.secretFiles}, `container-lifecycle.ts`), same as every
-    // other container's secrets.
+    // setup jobs to reach it. The pgsodium root key itself (PG15+ only) is a mode-`0644`
+    // entry at its exact path in the container's single in-memory Bun tar archive, streamed
+    // through `docker cp - <id>:/` without plaintext touching host disk. Addressing the
+    // unnamed container by the id returned from `docker create` works exactly like every
+    // other container's `secretFiles` delivery.
     const containerOpts: LegacyContainerOpts = {
       projectId: input.projectId,
       isBitbucketPipeline: input.isBitbucketPipeline,

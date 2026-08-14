@@ -45,7 +45,7 @@ const LEGACY_POSTGRES_PASSWORD = "postgres";
 
 /**
  * The exact in-container path Go's PG >= 15 entrypoint heredocs the pgsodium
- * root key to (`start.go:96`) — now a `secretFiles` `docker cp` target instead
+ * root key to (`start.go:96`) — now a `secretFiles` archive target instead
  * (see {@link legacyBuildPostgresStartContainerSpec}), not a heredoc.
  */
 const LEGACY_POSTGRES_PGSODIUM_ROOT_KEY_PATH = "/etc/postgresql-custom/pgsodium_root.key";
@@ -250,14 +250,12 @@ function legacyPostgresExtraEnv(
  * `Docker.ContainerCreate` over the Engine API directly rather than shelling
  * out. THIS PORT SHELLS OUT to a real `docker create`, so it deliberately
  * diverges here: the pgsodium root key travels via
- * {@link LegacyStartContainerSpec.secretFiles} instead (a short-lived HOST
- * temp file, mode `0644` — world-readable, because Postgres's entrypoint drops
- * root and reads this file back as the `postgres` user, and `docker cp`'s tar
- * transfer preserves the host file's mode verbatim; see
- * `legacyCopyStartSecretFileIntoContainer`'s doc comment — `docker cp`'d
- * straight into the container at that exact path — see
- * {@link legacyBuildPostgresStartContainerSpec}), so it never appears in this
- * process's own `docker create` argv (CWE-214/522).
+ * {@link LegacyStartContainerSpec.secretFiles} instead. The container
+ * lifecycle records it at its exact path with mode `0644` in one in-memory
+ * Bun tar archive for the container (Postgres drops root before reading it),
+ * then streams the archive through `docker cp - <id>:/`. No plaintext touches
+ * host disk or appears in this process's argv (CWE-214/522), and the pathless
+ * stdin transfer works with remote daemons and confined Docker clients.
  *
  * Otherwise byte-for-byte derived from Go's raw-string concatenation —
  * `NewContainerConfig(args ...string)` splices `strings.Join(args, " ")`
@@ -394,7 +392,7 @@ export function legacyBuildPostgresStartContainerSpec(
     // check is NOT part of `StartDatabase`'s `fromBackup` override, so this stays keyed on
     // `isPg14OrEarlier` alone, independent of `isRestore`.
     ...(isPg14OrEarlier ? { tmpfs: { "/docker-entrypoint-initdb.d": "" } } : {}),
-    // The pgsodium root key heredoc/bind is present whenever the ACTUAL entrypoint in use embeds
+    // The pgsodium root key delivery is present whenever the ACTUAL entrypoint in use embeds
     // it: both `legacyPostgresEntrypointScriptPg15` and `legacyPostgresEntrypointScriptRestore` do
     // (Go's `fromBackup` override always re-adds its own root-key heredoc, `start.go:147,155`,
     // regardless of major version); only the PG<=14 script never references it.
@@ -470,7 +468,7 @@ export interface LegacyShadowPostgresContainerSpecInput {
  *
  *  - **Empty `containerName`** (Go passes `""` to `DockerStart`, letting Docker
  *    auto-generate one) — see {@link LegacyStartContainerSpec.containerName}'s own doc
- *    comment for how the arg-builder and secret-file staging handle this.
+ *    comment for how the arg-builder and secret archive delivery handle this.
  *  - **`autoRemove: true`** — Go's `hostConfig.AutoRemove` (`--rm`).
  *  - **No volume bind** — the shadow is throwaway; Go's `hostConfig` sets no `Binds` at all.
  *  - **No `restartPolicy`** — Go's `hostConfig` sets no `RestartPolicy` either.
@@ -485,9 +483,8 @@ export interface LegacyShadowPostgresContainerSpecInput {
  *  - **The pgsodium root key `secretFiles` entry is still applied on PG >= 15** — the
  *    shadow's entrypoint script is the SAME `legacyPostgresEntrypointScriptPg15`, which
  *    still heredocs it in Go (splice point unaffected by `args`), so this port still needs
- *    it delivered before `docker start` — via `docker cp` straight into the container
- *    (`container-lifecycle.ts`), same as every other container's `secretFiles`, never a
- *    host temp file.
+ *    it delivered before `docker start` — as a mode-`0644` entry at its exact path in the
+ *    container's in-memory tar stream, same as every other container's `secretFiles`.
  *  - **Labels ARE still applied** (merged in by `legacyCreateContainer`, same as every
  *    other container) so `supabase stop`'s label-filtered sweep catches an orphaned shadow
  *    too — Go's `DockerStart` sets `CliProjectLabel`/`composeProjectLabel` unconditionally,

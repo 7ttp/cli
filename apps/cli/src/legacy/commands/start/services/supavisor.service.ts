@@ -8,10 +8,9 @@
  * IMPORTANT — how the Supavisor tenant is actually provisioned: it is NOT a
  * post-start `docker exec`. The rendered `pooler.exs` (via
  * `legacyRenderStartPoolerExs`, already ported in `../lib/template-render.ts`)
- * is built BEFORE the container is created, then baked directly into the
- * container's own startup `Cmd`
- * (`/bin/sh -c "/app/bin/migrate && /app/bin/supavisor eval '<script>' &&
- * /app/bin/server"`) — overriding the image's default `CMD` while keeping
+ * is built BEFORE the container is created and delivered to a fixed path
+ * inside it; the container's startup `Cmd` reads that file before evaluation.
+ * The command overrides the image's default `CMD` while keeping
  * its own `ENTRYPOINT` (no `Entrypoint` field is set here at all, matching
  * `docker-create-args.ts`'s documented Pooler precedent). There is no
  * separate post-start step: tenant creation runs once, as part of the
@@ -23,13 +22,13 @@
  * directly, so that `Cmd` string never becomes a subprocess's own argv.
  * THIS PORT SHELLS OUT to a real `docker create`, where that would leak, so
  * it deliberately diverges: the rendered script travels via
- * {@link LegacyStartContainerSpec.secretFiles} instead (a short-lived HOST
- * temp file, mode `0644`, `docker cp`'d straight into the container at
- * {@link LEGACY_SUPAVISOR_POOLER_TENANT_CONTAINER_PATH}) — Supavisor itself
- * runs fully as root in its image, so it is unaffected by the non-root read
- * issue that motivates `0644` for Kong/Postgres (see
- * `legacyCopyStartSecretFileIntoContainer`'s doc comment); the file mode is
- * simply widened here for consistency with the other staged secrets, and
+ * {@link LegacyStartContainerSpec.secretFiles} instead. The container
+ * lifecycle places it at mode `0644` in the container's single in-memory Bun
+ * tar archive and streams that archive through `docker cp - <id>:/`, which
+ * materializes {@link LEGACY_SUPAVISOR_POOLER_TENANT_CONTAINER_PATH} without
+ * writing plaintext to host disk. Supavisor itself runs fully as root, so the
+ * mode is simply consistent with the other archive entries. The pathless
+ * stdin transfer also works with remote daemons and confined Docker clients.
  * {@link legacyBuildSupavisorStartCmd} only ever references that FIXED path
  * — never the secret content itself (CWE-214/522). See that function's doc
  * comment for the resulting quoting nuance. {@link legacyBuildSupavisorStartCmd}
@@ -62,9 +61,8 @@ const LEGACY_SUPAVISOR_SESSION_PORT = "5432";
 const LEGACY_SUPAVISOR_TRANSACTION_PORT = "6543";
 
 /**
- * The fixed in-container path the rendered `pooler.exs` tenant script is
- * `docker cp`'d to (see {@link legacyBuildSupavisorContainerSpec}'s
- * `secretFiles`).
+ * The fixed in-container path materialized for the rendered `pooler.exs`
+ * tenant script (see {@link legacyBuildSupavisorContainerSpec}'s `secretFiles`).
  */
 const LEGACY_SUPAVISOR_POOLER_TENANT_CONTAINER_PATH = "/app/pooler_tenant.exs";
 

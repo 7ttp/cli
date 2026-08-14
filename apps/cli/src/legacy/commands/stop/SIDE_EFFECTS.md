@@ -13,27 +13,26 @@ model (see the CLI-1324 plan's "Critical architectural finding" for why).
 
 ## Files Written
 
-| Path                                                                | Format              | When                                                                                    |
-| ------------------------------------------------------------------- | ------------------- | --------------------------------------------------------------------------------------- |
-| `~/.supabase/telemetry.json`                                        | JSON                | always (in `Effect.ensuring`) at end of command                                         |
-| `<workdir>/supabase/.temp/start-secrets/<container-name>` (removed) | plaintext, per-file | after teardown succeeds, for every container name torn down that had a staged directory |
+| Path                                                                | Format              | When                                                                               |
+| ------------------------------------------------------------------- | ------------------- | ---------------------------------------------------------------------------------- |
+| `~/.supabase/telemetry.json`                                        | JSON                | always (in `Effect.ensuring`) at end of command                                    |
+| `<workdir>/supabase/.temp/start-secrets/<container-name>` (removed) | plaintext, per-file | after teardown succeeds, for an Edge Runtime container that had a staged directory |
 
-The `start-secrets` removal is a TS-port-only hygiene step (`legacyCleanupStartSecrets`,
-`legacy/shared/legacy-start-secrets-cleanup.ts`) — the old Go CLI never staged secrets on
-host disk in the first place, so it has nothing to clean up here. Only Edge Runtime's own
-JWT/service-role-key/secret env artifacts (`shared/functions/serve.ts`'s
+The `start-secrets` removal is an Edge Runtime-specific TS-port hygiene step
+(`legacyCleanupStartSecrets`, `legacy/shared/legacy-start-secrets-cleanup.ts`). Edge
+Runtime's JWT/service-role-key/secret env artifacts (`shared/functions/serve.ts`'s
 `writeDockerEnvFile`/`writeDockerMultilineEnvScript`/`writeServeMainTemplateFile`) still
 land on host disk this way, because that container is a `docker run` this port shells out
 to directly rather than a struct call over the Docker Engine API; without this cleanup that
-directory would survive `stop` indefinitely. (Kong's TLS/`kong.yml`, Postgres's pgsodium
-root key, and Supavisor's pooler tenant-script content are delivered via `docker cp`
-straight into the created container instead — as of supabase/cli#6022 they never touch
-host disk at all, see `start`'s own `SIDE_EFFECTS.md` — so this sweep is now a no-op for
-those three.) The containers to clean are captured via `legacyDockerRemoveAll`'s own
-`onContainersRemoved` hook, which fires only once `docker container prune` has CONFIRMED
+directory would survive `stop` indefinitely. Kong, Postgres, and Supavisor instead combine
+their `secretFiles` into one in-memory mode-`0644` Bun tar archive per container and stream
+it via `docker cp - <id>:/`; no plaintext host path exists, and remote or confined Docker
+clients can consume the same stdin stream. The containers to clean are captured via
+`legacyDockerRemoveAll`'s own `onContainersRemoved` hook, which fires only once
+`docker container prune` has CONFIRMED
 they're actually gone — not at the initial `docker ps` listing, and not before the
 stop/prune stages have even run — so a container the stop stage itself failed on (meaning
-`container prune` never ran and nothing was actually removed) keeps its secrets, and a
+`container prune` never ran and nothing was actually removed) keeps its bind-mounted files, and a
 container still running after a later, unrelated failure (volume/network prune) is never
 touched. The hook is fed by `legacyDockerRemoveAll`'s single internal `docker ps` listing
 (no separate, second `docker ps` call — see that function's doc comment for the parity
@@ -46,7 +45,7 @@ label (stamped on every container `start` creates, `container-lifecycle.ts`) rat
 this invocation's own `<workdir>`: `stop --all`/`stop --project-id <other>` can tear down a
 DIFFERENT project's containers than the one this invocation's own cwd/`--workdir` points
 at, and using this invocation's workdir unconditionally would look in the wrong directory,
-silently orphaning that other project's staged secret files forever (the containers are
+silently orphaning that other project's Edge Runtime staging forever (the containers are
 now gone, so no future `stop` could rediscover them via `docker ps` either). This
 invocation's own `<workdir>` is used only as a fallback, for a container with no such label
 (created before this label existed).
