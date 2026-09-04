@@ -190,8 +190,11 @@ not implemented.
 `docker`/`podman` must be resolvable on `PATH` — same fallback behavior as `stop`/`status`.
 
 `--debug` tees the fresh-volume PG15+ one-shot migrate jobs' (realtime/storage/auth) own
-stderr to the parent process's stderr in real time — outside `--debug` only each job's exit
-code is surfaced on failure.
+stderr to the parent process's stderr in real time. With or without `--debug`, a job that
+exits non-zero fails as `error running container: exit N (<image>)` — the image names the
+failing job — followed by the tail of its captured stderr (database passwords in echoed
+DSNs redacted, then the last 2048 characters, cut back to a whole line when the window
+opens mid-line; omitted when empty) — supabase/cli#6462.
 
 ## Exit Codes
 

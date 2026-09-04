@@ -278,6 +278,12 @@ path has no confirmation prompt.
   decrypts them into `toml.vault`, and `legacyUpsertVaultSecrets` upserts the
   decrypted values unconditionally, before either branch (schema-files or migrations)
   runs.
+- **One-shot migrate job failures** (PG15) surface as
+  `error running container: exit N (<image>)` — the image names the failing job —
+  followed by the tail of the job's own stderr (database passwords in echoed DSNs
+  redacted, then the last 2048 characters, cut back to a whole line when the window
+  opens mid-line; omitted when empty), with or without `--debug` (#6462) — the same
+  shape as `db start`/`supabase start`.
 - **Migrations catalog cache**: gated on no `--version`/`--last` having resolved
   a version, pg-delta being enabled (`[experimental.pgdelta].enabled` or
   `SUPABASE_EXPERIMENTAL_PG_DELTA` — see Environment Variables), AND the legacy engine

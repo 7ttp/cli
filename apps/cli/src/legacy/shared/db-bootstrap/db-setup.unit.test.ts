@@ -22,6 +22,7 @@ import {
 import { LegacyPgDeltaSslProbe } from "../legacy-pgdelta-ssl-probe.service.ts";
 import {
   LegacyDbSetupError,
+  legacyJobStderrTail,
   legacyResolveDbSetupPrelude,
   legacyRunDatabaseWebhooksSetup,
   legacyStartInitCurrentBranch,
@@ -80,7 +81,7 @@ function fakeSession() {
   return { session, calls };
 }
 
-function mockDockerRun(opts: { exitCode?: number } = {}) {
+function mockDockerRun(opts: { exitCode?: number; stderr?: string } = {}) {
   const runs: Array<LegacyDockerRunOpts> = [];
   const captureOptsCalls: Array<{ readonly teeStderr?: boolean } | undefined> = [];
   const layer = Layer.succeed(LegacyDockerRun, {
@@ -91,7 +92,7 @@ function mockDockerRun(opts: { exitCode?: number } = {}) {
       return Effect.succeed({
         exitCode: opts.exitCode ?? 0,
         stdout: new Uint8Array(),
-        stderr: "",
+        stderr: opts.stderr ?? "",
       });
     },
     // `legacyRunStartMigrateJob` (`db-setup.ts`) discards stdout via `runStream` (not
@@ -101,7 +102,7 @@ function mockDockerRun(opts: { exitCode?: number } = {}) {
     runStream: (runOpts, streamOpts) => {
       runs.push(runOpts);
       captureOptsCalls.push({ teeStderr: streamOpts.teeStderr });
-      return Effect.succeed({ exitCode: opts.exitCode ?? 0, stderr: "" });
+      return Effect.succeed({ exitCode: opts.exitCode ?? 0, stderr: opts.stderr ?? "" });
     },
   });
   return { layer, runs, captureOptsCalls };
@@ -585,7 +586,74 @@ describe("legacyStartSetupLocalDatabase", () => {
         Effect.flip,
         Effect.map((error) => {
           expect(error).toBeInstanceOf(LegacyDbSetupError);
-          expect((error as LegacyDbSetupError).message).toBe("error running container: exit 1");
+          expect((error as LegacyDbSetupError).message).toBe(
+            "error running container: exit 1 (public.ecr.aws/supabase/realtime:v2.34.7)",
+          );
+          rmSync(workdir, { recursive: true, force: true });
+        }),
+      );
+    });
+
+    it.effect("a failing job's captured stderr is surfaced after the exit line (#6462)", () => {
+      const workdir = makeWorkdir();
+      const { session } = fakeSession();
+      const out = mockOutput();
+      const docker = mockDockerRun({
+        exitCode: 1,
+        stderr: "sudo: account validation failure, is your account locked?\n",
+      });
+      const config = decodeConfig({ storage: { enabled: false }, auth: { enabled: false } });
+      return run(baseInput(workdir, session, { majorVersion: 15, config }), out, docker).pipe(
+        Effect.flip,
+        Effect.map((error) => {
+          expect(error).toBeInstanceOf(LegacyDbSetupError);
+          expect((error as LegacyDbSetupError).message).toBe(
+            "error running container: exit 1 (public.ecr.aws/supabase/realtime:v2.34.7)\nsudo: account validation failure, is your account locked?",
+          );
+          rmSync(workdir, { recursive: true, force: true });
+        }),
+      );
+    });
+
+    it.effect(
+      "only a bounded tail of a verbose failing job's stderr is kept, cut at a line boundary",
+      () => {
+        const workdir = makeWorkdir();
+        const { session } = fakeSession();
+        const out = mockOutput();
+        // 10 000 chars of one-line noise ahead of the cause: the 2048-char window opens
+        // mid-noise, and that half line must not survive above the real cause.
+        const noise = "x".repeat(10_000);
+        const docker = mockDockerRun({ exitCode: 1, stderr: `${noise}\nFATAL: the real cause\n` });
+        const config = decodeConfig({ storage: { enabled: false }, auth: { enabled: false } });
+        return run(baseInput(workdir, session, { majorVersion: 15, config }), out, docker).pipe(
+          Effect.flip,
+          Effect.map((error) => {
+            expect((error as LegacyDbSetupError).message).toBe(
+              "error running container: exit 1 (public.ecr.aws/supabase/realtime:v2.34.7)\nFATAL: the real cause",
+            );
+            rmSync(workdir, { recursive: true, force: true });
+          }),
+        );
+      },
+    );
+
+    it.effect("a database password echoed into the failing job's stderr is redacted", () => {
+      const workdir = makeWorkdir();
+      const { session } = fakeSession();
+      const out = mockOutput();
+      const docker = mockDockerRun({
+        exitCode: 1,
+        stderr:
+          "connecting to postgresql://supabase_storage_admin:s3cret@db:5432/postgres\nerror: connection refused\n",
+      });
+      const config = decodeConfig({ storage: { enabled: false }, auth: { enabled: false } });
+      return run(baseInput(workdir, session, { majorVersion: 15, config }), out, docker).pipe(
+        Effect.flip,
+        Effect.map((error) => {
+          expect((error as LegacyDbSetupError).message).toBe(
+            "error running container: exit 1 (public.ecr.aws/supabase/realtime:v2.34.7)\nconnecting to postgresql://supabase_storage_admin:[REDACTED]@db:5432/postgres\nerror: connection refused",
+          );
           rmSync(workdir, { recursive: true, force: true });
         }),
       );
@@ -892,6 +960,43 @@ describe("legacyStartSetupLocalDatabase", () => {
         );
       },
     );
+  });
+});
+
+describe("legacyJobStderrTail", () => {
+  it("keeps everything up to the window, minus surrounding whitespace", () => {
+    expect(legacyJobStderrTail("")).toBe("");
+    expect(legacyJobStderrTail("\n  \n")).toBe("");
+    expect(legacyJobStderrTail("one\ntwo\n")).toBe("one\ntwo");
+    expect(legacyJobStderrTail(`${"a".repeat(2048)}\n`)).toBe("a".repeat(2048));
+  });
+
+  it("cuts back to the next line boundary only when the window opens mid-line", () => {
+    // Window opens exactly on a line start: nothing to trim.
+    expect(legacyJobStderrTail(`${"b".repeat(999)}\n${"c".repeat(2048)}`)).toBe("c".repeat(2048));
+    // Window opens on the line break itself: only that break goes.
+    expect(legacyJobStderrTail(`${"b".repeat(999)}\n${"c".repeat(2047)}\n`)).toBe("c".repeat(2047));
+    // Window opens mid-noise: the half line above the cause is dropped.
+    expect(legacyJobStderrTail(`${"x".repeat(10_000)}\nFATAL: the real cause\n`)).toBe(
+      "FATAL: the real cause",
+    );
+  });
+
+  it("keeps one over-long line cut rather than dropping the whole payload", () => {
+    // A single 3000-char JSON log line, with or without its trailing newline, is the
+    // norm for structured loggers; the only newline must not empty the tail.
+    expect(legacyJobStderrTail(`${"j".repeat(3000)}\n`)).toBe("j".repeat(2048));
+    expect(legacyJobStderrTail("j".repeat(3000))).toBe("j".repeat(2048));
+  });
+
+  it("redacts a DSN that straddles the cut instead of leaking the password fragment", () => {
+    const dsn = "postgresql://supabase_admin:s3cret-pw@db:5432/postgres";
+    // 2060 raw chars, 2061 once the 9-char password becomes `[REDACTED]`: the window
+    // opens 13 chars in, just past `postgresql://` — the anchor the redaction keys on.
+    const line = `${dsn} `.padEnd(2060, "p");
+    const tail = legacyJobStderrTail(`${line}\n`);
+    expect(tail).not.toContain("s3cret-pw");
+    expect(tail.startsWith("supabase_admin:[REDACTED]@db:5432/postgres ")).toBe(true);
   });
 });
 

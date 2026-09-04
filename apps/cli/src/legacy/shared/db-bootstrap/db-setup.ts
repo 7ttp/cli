@@ -208,10 +208,9 @@ const LEGACY_START_REMOVE_DATABASE_WEBHOOKS_SQL = "drop extension if exists pg_n
 /**
  * A SQL exec (schema/globals/API-privileges) or one-shot service-migration Docker
  * job failed, or the scratch temp directory/file could not be created. The Docker
- * job branch's message mirrors Go's `DockerRunOnceWithStream` failure shape
- * (`errors.Errorf("error running container: %w", err)`, `apps/cli-go/internal/
- * utils/docker.go:469-487,559-591` — Go discards the container's own stdout/stderr
- * outside `--debug`, so only the exit code is meaningful here too).
+ * job branch's message keeps the established `error running container: exit N`
+ * first line, extended with the failing job's image, followed by the tail of the
+ * job's own stderr when it printed any (`legacyRunStartMigrateJob`).
  */
 export class LegacyDbSetupError extends Data.TaggedError("LegacyDbSetupError")<{
   readonly message: string;
@@ -632,16 +631,55 @@ const legacyStartInitSchemaPre15 = Effect.fnUntraced(function* (
 });
 
 /**
+ * How much of a failed one-shot job's captured stderr survives into the
+ * `LegacyDbSetupError` message — enough for a stack trace or a shell trace's last
+ * screenful, small enough that the error stays a readable terminal message.
+ */
+const JOB_STDERR_TAIL_MAX_CHARS = 2048;
+
+/**
+ * The part of a failed job's stderr that goes into its `LegacyDbSetupError`: the
+ * database password redacted out of any DSN a service echoed (the jobs receive
+ * `DATABASE_URL`/`PGRST_DB_URI`-style env, and a crashing service commonly prints its
+ * config), the same way the migrations-catalog warning below redacts its own message —
+ * redacted BEFORE the cut, so a DSN straddling it cannot lose the `://` anchor the
+ * redaction keys on and slip through in pieces, over a buffer first bounded to a few
+ * windows' worth so the per-line regex never walks a runaway line in full — then the
+ * last {@link JOB_STDERR_TAIL_MAX_CHARS} of that, cut back to the next line boundary
+ * when the window opens mid-line and holds one (a half line at the top reads as
+ * garbage; one over-long line is kept cut rather than dropped). Empty when the job
+ * printed nothing.
+ */
+export function legacyJobStderrTail(stderr: string): string {
+  const redacted = stderr
+    .slice(-4 * JOB_STDERR_TAIL_MAX_CHARS)
+    .split("\n")
+    .map(redactLegacyConnectionString)
+    .join("\n")
+    .trimEnd();
+  const cut = redacted.length - JOB_STDERR_TAIL_MAX_CHARS;
+  let tail = redacted.slice(Math.max(cut, 0));
+  if (cut > 0 && redacted[cut - 1] !== "\n") {
+    const firstBreak = tail.indexOf("\n");
+    if (firstBreak !== -1) tail = tail.slice(firstBreak + 1);
+  }
+  return tail.trim();
+}
+
+/**
  * Runs one PG15+ one-shot service-migration job to completion (Go's
  * `utils.DockerRunJob` = `DockerRunOnceWithStream`, `docker.go:457-459,469-487`):
  * foreground, same Docker network as `db`, no entrypoint override (Go's plain
  * `Cmd` field), stdout always discarded (Go's own `stdout` writer here is always
- * `io.Discard`, `start.go:352`) and stderr teed to the parent process's own stderr ONLY
- * under `--debug` — Go passes `logger := utils.GetDebugLogger()` as the job's stderr
- * writer (`os.Stderr` under `--debug`, else `io.Discard`, `logger.go:10-15`) — so a
- * fresh-volume Realtime/Storage/Auth migration job's own diagnostics are visible when
- * `db start --debug`/`supabase start --debug` is used, not just its exit code. A
- * non-zero exit fails with the same shape as Go's `error running container: <cause>`.
+ * `io.Discard`, `start.go:352`) and stderr teed live to the parent process's own
+ * stderr ONLY under `--debug` — Go passes `logger := utils.GetDebugLogger()` as the
+ * job's stderr writer (`os.Stderr` under `--debug`, else `io.Discard`,
+ * `logger.go:10-15`). A non-zero exit fails as `error running container: exit N
+ * (<image>)` — the image names which of the three jobs died, since nothing else in
+ * the output does — followed by the tail of the job's stderr
+ * ({@link legacyJobStderrTail}) when it printed any, so the container's own failure
+ * reason reaches the user with or without `--debug`
+ * (https://github.com/supabase/cli/issues/6462).
  *
  * Resolves `opts.image` itself, individually, right here — via `legacyEnsureImagesCached`
  * (NOT `LegacyDockerRun.runStream`'s own ambient-only resolver, which never sees
@@ -721,9 +759,13 @@ const legacyRunStartMigrateJob = Effect.fnUntraced(function* (
       ),
     );
   if (result.exitCode !== 0) {
+    // `runStream` buffers the job's stderr regardless of `teeStderr`; without this
+    // tail a user who did not run `--debug` saw only the exit code (#6462).
+    const stderrTail = legacyJobStderrTail(result.stderr);
+    const headline = `error running container: exit ${result.exitCode} (${resolvedImage})`;
     return yield* Effect.fail(
       new LegacyDbSetupError({
-        message: `error running container: exit ${result.exitCode}`,
+        message: stderrTail.length > 0 ? `${headline}\n${stderrTail}` : headline,
         reason: "database",
       }),
     );
