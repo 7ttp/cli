@@ -336,6 +336,15 @@ const removedVolumes = (spawned: ReadonlyArray<SpawnRecord>): ReadonlyArray<stri
 const restartedContainers = (spawned: ReadonlyArray<SpawnRecord>): ReadonlyArray<string> =>
   spawned.filter((s) => s.args[0] === "restart").map((s) => s.args[1] ?? "");
 
+// The pre-teardown satellite fence (`legacyWithSatelliteFence`, #6445).
+const stoppedContainers = (spawned: ReadonlyArray<SpawnRecord>): ReadonlyArray<string> =>
+  spawned.filter((s) => s.args[0] === "stop").map((s) => s.args[1] ?? "");
+
+// `docker start`s — the fence's failed-reset restore plus the db container's own
+// post-create start.
+const startedContainers = (spawned: ReadonlyArray<SpawnRecord>): ReadonlyArray<string> =>
+  spawned.filter((s) => s.args[0] === "start").map((s) => s.args[1] ?? "");
+
 const kongReloadCalls = (spawned: ReadonlyArray<SpawnRecord>): ReadonlyArray<SpawnRecord> =>
   spawned.filter((s) => s.args[0] === "exec" && s.args[1] === KONG_ID);
 
@@ -351,6 +360,8 @@ interface DefaultRouteOpts {
   readonly kongReloadFails?: boolean;
   readonly storageMissing?: boolean;
   readonly restartFails?: ReadonlyArray<string>;
+  readonly stopFails?: ReadonlyArray<string>;
+  readonly startFails?: ReadonlyArray<string>;
 }
 
 function defaultLocalResetRoute(opts: DefaultRouteOpts = {}) {
@@ -366,11 +377,24 @@ function defaultLocalResetRoute(opts: DefaultRouteOpts = {}) {
       const name = containerNameFromCreateArgs(args);
       return { stdout: [fakeContainerId(name)] };
     }
-    if (args[0] === "start") return { exitCode: 0 };
+    if (args[0] === "start") {
+      const id = args[1] ?? "";
+      if (opts.startFails?.includes(id) === true) {
+        return { exitCode: 1, stderr: [`Error: failed to start ${id}`] };
+      }
+      return { exitCode: 0 };
+    }
     if (args[0] === "restart") {
       const id = args[1] ?? "";
       if (opts.restartFails?.includes(id) === true) {
         return { exitCode: 1, stderr: [`Error: failed to restart ${id}`] };
+      }
+      return { exitCode: 0 };
+    }
+    if (args[0] === "stop") {
+      const id = args[1] ?? "";
+      if (opts.stopFails?.includes(id) === true) {
+        return { exitCode: 1, stderr: [`Error: failed to stop ${id}`] };
       }
       return { exitCode: 0 };
     }
@@ -584,6 +608,23 @@ describe("legacy db reset", () => {
         expect(removedContainers(child.spawned)).toContain(DB_ID);
         expect(removedVolumes(child.spawned)).toContain(DB_ID);
         expect(createArgs(child.spawned)).not.toBeUndefined();
+        // The pre-teardown fence (#6445): every satellite is stopped before the db
+        // container is removed.
+        expect(stoppedContainers(child.spawned)).toEqual(
+          expect.arrayContaining([
+            "supabase_storage_test",
+            "supabase_auth_test",
+            "supabase_realtime_test",
+            "supabase_pooler_test",
+          ]),
+        );
+        const dbRemoveIndex = child.spawned.findIndex(
+          (s) => s.args[0] === "container" && s.args[1] === "rm",
+        );
+        const lastStopIndex = child.spawned.findLastIndex((s) => s.args[0] === "stop");
+        expect(dbRemoveIndex).toBeGreaterThanOrEqual(0);
+        expect(lastStopIndex).toBeGreaterThanOrEqual(0);
+        expect(lastStopIndex).toBeLessThan(dbRemoveIndex);
         // Default config: realtime, storage, and auth are all enabled (PG >= 15 default).
         expect(dbSetupJobCalls(child.spawned)).toHaveLength(3);
         expect(out.stderrText).toContain("Restarting containers...\n");
@@ -597,12 +638,120 @@ describe("legacy db reset", () => {
           ]),
         );
         expect(kongReloadCalls(child.spawned)).toHaveLength(1);
+        // The fence's failed-reset restore never fires on success: the only `docker start`
+        // is the db container's own post-create one.
+        expect(startedContainers(child.spawned)).toEqual([fakeContainerId(DB_ID)]);
+        expect(out.stderrText).not.toContain("WARNING:");
         expect(out.stderrText).toContain("Finished ");
         expect(out.stderrText).toContain("on branch ");
         // The local-reset composition now lives in the shared
         // `legacyResetLocalDatabase` (CLI-2062) — confirm this handler's own
         // single `Effect.ensuring` finalizer still fires exactly once through it.
         expect(telemetry.flushCount).toBe(1);
+      });
+    });
+
+    it.live("a genuine satellite stop failure aborts BEFORE the database is destroyed", () => {
+      const { layer, child } = setup(tmp.current, {
+        toml: 'project_id = "test"\n',
+        args: ["db", "reset", "--local"],
+        isLocal: true,
+        routeOpts: { stopFails: ["supabase_realtime_test"] },
+      });
+      return Effect.gen(function* () {
+        const exit = yield* legacyDbReset(DEFAULT_FLAGS).pipe(Effect.provide(layer), Effect.exit);
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          expect(JSON.stringify(exit.cause)).toContain("failed to stop supabase_realtime_test");
+          // The suggestion says what a stop failure means for the user's data.
+          expect(JSON.stringify(exit.cause)).toContain("The database was not touched.");
+        }
+        // The fence's whole point: an unfenced writer means the teardown must not
+        // begin — no container removal, no volume removal, nothing recreated...
+        expect(removedContainers(child.spawned)).toHaveLength(0);
+        expect(removedVolumes(child.spawned)).toHaveLength(0);
+        expect(createArgs(child.spawned)).toBeUndefined();
+        // ...and the restore still runs, so the three that did stop come back.
+        expect(startedContainers(child.spawned)).toEqual(
+          expect.arrayContaining([
+            "supabase_storage_test",
+            "supabase_auth_test",
+            "supabase_pooler_test",
+          ]),
+        );
+      });
+    });
+
+    it.live("a failed migration still brings the fenced satellites back, silently", () => {
+      const { layer, out, child } = setup(tmp.current, {
+        toml: 'project_id = "test"\n',
+        files: migrationFile("20240101000000", "create table boom ();"),
+        args: ["db", "reset", "--local"],
+        isLocal: true,
+        execFailsOn: "create table boom",
+        execFailsMessage: "relation boom already exists",
+      });
+      return Effect.gen(function* () {
+        const exit = yield* legacyDbReset(DEFAULT_FLAGS).pipe(Effect.provide(layer), Effect.exit);
+        // The migration's own error is the one reported, not a restore-path one.
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          expect(JSON.stringify(exit.cause)).toContain("relation boom already exists");
+        }
+        // Without the restore, a bad migration would now leave auth/storage/realtime/
+        // pooler stopped — worse than before the fence existed. `docker start`, not
+        // `restart`: the success path never ran, so there is nothing to bounce.
+        expect(startedContainers(child.spawned)).toEqual(
+          expect.arrayContaining([
+            "supabase_storage_test",
+            "supabase_auth_test",
+            "supabase_realtime_test",
+            "supabase_pooler_test",
+          ]),
+        );
+        expect(restartedContainers(child.spawned)).toHaveLength(0);
+        expect(kongReloadCalls(child.spawned)).toHaveLength(1);
+        expect(out.stderrText).not.toContain("Restarting containers...");
+        expect(out.stderrText).not.toContain("WARNING:");
+      });
+    });
+
+    it.live("warns with a recovery hint when the satellites cannot be brought back", () => {
+      const { layer, out, child } = setup(tmp.current, {
+        toml: 'project_id = "test"\n',
+        files: migrationFile("20240101000000", "create table boom ();"),
+        args: ["db", "reset", "--local"],
+        isLocal: true,
+        execFailsOn: "create table boom",
+        execFailsMessage: "relation boom already exists",
+        routeOpts: { startFails: ["supabase_auth_test"] },
+      });
+      return Effect.gen(function* () {
+        const exit = yield* legacyDbReset(DEFAULT_FLAGS).pipe(Effect.provide(layer), Effect.exit);
+        // Still the migration's error — the restore failure is reported alongside it,
+        // not instead of it.
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          expect(JSON.stringify(exit.cause)).toContain("relation boom already exists");
+          expect(JSON.stringify(exit.cause)).not.toContain("failed to start supabase_auth_test");
+        }
+        // Styled tokens (`WARNING:`, the two commands) are asserted apart from the plain text.
+        expect(out.stderrText).toContain("WARNING:");
+        expect(out.stderrText).toContain(
+          " the local services could not be restarted after the failed reset: failed to start supabase_auth_test: Error: failed to start supabase_auth_test\n",
+        );
+        expect(out.stderrText).toContain("supabase stop");
+        expect(out.stderrText).toContain("supabase start");
+        expect(out.stderrText).toContain(" to bring them back.\n");
+        // The other three were still started; Kong is not reloaded after a failed restore.
+        expect(startedContainers(child.spawned)).toEqual(
+          expect.arrayContaining([
+            "supabase_storage_test",
+            "supabase_realtime_test",
+            "supabase_pooler_test",
+          ]),
+        );
+        expect(kongReloadCalls(child.spawned)).toHaveLength(0);
       });
     });
 
@@ -823,7 +972,7 @@ describe("legacy db reset", () => {
 
   describe("local reset — Kong reload", () => {
     it.live("fails the whole command with the exact suggestion when Kong reload fails", () => {
-      const { layer } = setup(tmp.current, {
+      const { layer, out, child } = setup(tmp.current, {
         toml: 'project_id = "test"\n',
         args: ["db", "reset", "--local"],
         isLocal: true,
@@ -841,6 +990,12 @@ describe("legacy db reset", () => {
           );
           expect(error.suggestion).toContain(`docker restart ${KONG_ID}`);
         }
+        // The reload runs after the satellite fence has ended: its failure is reported
+        // once, with no second reload attempt and no restore-path WARNING ahead of it.
+        expect(kongReloadCalls(child.spawned)).toHaveLength(1);
+        // The only `docker start` is the recreated db container's own.
+        expect(startedContainers(child.spawned)).toEqual([fakeContainerId(DB_ID)]);
+        expect(out.stderrText).not.toContain("WARNING:");
       });
     });
 
@@ -873,7 +1028,7 @@ describe("legacy db reset", () => {
     });
 
     it.live("fails the command when a satellite restart fails", () => {
-      const { layer } = setup(tmp.current, {
+      const { layer, out, child } = setup(tmp.current, {
         toml: 'project_id = "test"\n',
         args: ["db", "reset", "--local"],
         isLocal: true,
@@ -885,6 +1040,10 @@ describe("legacy db reset", () => {
         if (Exit.isFailure(exit)) {
           expect(JSON.stringify(exit.cause)).toContain("failed to restart supabase_storage_test");
         }
+        // A `docker start` after the failed `docker restart` would fail the same way: the
+        // restart is outside the fence, so it is reported as is, with no restore attempt.
+        expect(startedContainers(child.spawned)).toEqual([fakeContainerId(DB_ID)]);
+        expect(out.stderrText).not.toContain("WARNING:");
       });
     });
   });
@@ -900,6 +1059,20 @@ describe("legacy db reset", () => {
         });
         return Effect.gen(function* () {
           yield* legacyDbReset(DEFAULT_FLAGS).pipe(Effect.provide(layer));
+          // The same fence as PG15+ (#6445): every satellite is stopped before anything
+          // is restarted (stop-before-SQL is pinned by the stop-failure test below).
+          expect(stoppedContainers(child.spawned)).toEqual(
+            expect.arrayContaining([
+              "supabase_storage_test",
+              "supabase_auth_test",
+              "supabase_realtime_test",
+              "supabase_pooler_test",
+            ]),
+          );
+          const lastStopIndex = child.spawned.findLastIndex((s) => s.args[0] === "stop");
+          const firstRestartIndex = child.spawned.findIndex((s) => s.args[0] === "restart");
+          expect(lastStopIndex).toBeGreaterThanOrEqual(0);
+          expect(firstRestartIndex).toBeGreaterThan(lastStopIndex);
           // recreateDatabase: no container/volume removal at all on this branch.
           expect(removedContainers(child.spawned)).toHaveLength(0);
           expect(
@@ -928,9 +1101,33 @@ describe("legacy db reset", () => {
           );
           expect(dbRestartIndex).toBeGreaterThanOrEqual(0);
           expect(kongReloadIndex).toBeGreaterThan(dbRestartIndex);
+          // One reload, and no `docker start` at all: the fence's failed-reset restore
+          // never fires on success.
+          expect(kongReloadCalls(child.spawned)).toHaveLength(1);
+          expect(startedContainers(child.spawned)).toHaveLength(0);
+          expect(out.stderrText).not.toContain("WARNING:");
         });
       },
     );
+
+    it.live("a genuine satellite stop failure aborts BEFORE any SQL runs (PG14)", () => {
+      const { layer, child, conn } = setup(tmp.current, {
+        toml: PG14_TOML,
+        args: ["db", "reset", "--local"],
+        isLocal: true,
+        routeOpts: { stopFails: ["supabase_auth_test"] },
+      });
+      return Effect.gen(function* () {
+        const exit = yield* legacyDbReset(DEFAULT_FLAGS).pipe(Effect.provide(layer), Effect.exit);
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          expect(JSON.stringify(exit.cause)).toContain("failed to stop supabase_auth_test");
+        }
+        // No disconnect, no DROP/CREATE, no db-container restart — the database is intact.
+        expect(conn.execs).toHaveLength(0);
+        expect(restartedContainers(child.spawned)).not.toContain(DB_ID);
+      });
+    });
 
     it.live(
       "attaches Go's ExecBatch error context to a failed DROP/CREATE DATABASE statement",
@@ -939,7 +1136,7 @@ describe("legacy db reset", () => {
         // a batch executor, so a failure gets the same rich context
         // (`At statement: <index>` + the statement text) a real migration
         // file failure would — not the bare driver error (review CLI-1958).
-        const { layer } = setup(tmp.current, {
+        const { layer, child } = setup(tmp.current, {
           toml: PG14_TOML,
           args: ["db", "reset", "--local"],
           isLocal: true,
@@ -957,6 +1154,18 @@ describe("legacy db reset", () => {
             expect(cause).toContain("At statement: 1");
             expect(cause).toContain("CREATE DATABASE postgres WITH OWNER postgres");
           }
+          // Failed inside the fence: the stopped satellites are started again (never
+          // restarted — the db itself was not bounced) and Kong reloaded once.
+          expect(startedContainers(child.spawned)).toEqual(
+            expect.arrayContaining([
+              "supabase_storage_test",
+              "supabase_auth_test",
+              "supabase_realtime_test",
+              "supabase_pooler_test",
+            ]),
+          );
+          expect(restartedContainers(child.spawned)).toHaveLength(0);
+          expect(kongReloadCalls(child.spawned)).toHaveLength(1);
         });
       },
     );
@@ -1143,6 +1352,32 @@ describe("legacy db reset", () => {
         expect(
           conn.execs.some((sql) => sql.includes("insert into pg14_seed_marker values (1)")),
         ).toBe(true);
+      });
+    });
+
+    it.live("a failed PG14 migration replay reports once — the satellites are already back", () => {
+      // MigrateAndSeed runs AFTER the satellite restarts on this branch, so the fence has
+      // already ended: no `docker start` restore, no second Kong reload, no WARNING.
+      const { layer, out, child } = setup(tmp.current, {
+        toml: PG14_TOML,
+        files: migrationFile("20240101000000", "create table boom ();"),
+        args: ["db", "reset", "--local"],
+        isLocal: true,
+        execFailsOn: "create table boom",
+        execFailsMessage: "relation boom already exists",
+      });
+      return Effect.gen(function* () {
+        const exit = yield* legacyDbReset(DEFAULT_FLAGS).pipe(Effect.provide(layer), Effect.exit);
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          expect(JSON.stringify(exit.cause)).toContain("relation boom already exists");
+        }
+        expect(restartedContainers(child.spawned)).toEqual(
+          expect.arrayContaining([DB_ID, "supabase_storage_test", "supabase_auth_test"]),
+        );
+        expect(startedContainers(child.spawned)).toHaveLength(0);
+        expect(kongReloadCalls(child.spawned)).toHaveLength(1);
+        expect(out.stderrText).not.toContain("WARNING:");
       });
     });
 

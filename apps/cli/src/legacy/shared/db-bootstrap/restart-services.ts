@@ -1,23 +1,25 @@
 /**
- * Post-recreate satellite-container restart + Kong reload, shared by both PG14's
- * `RestartDatabase` and PG15's `resetDatabase15` (`apps/cli-go/internal/db/reset/
- * reset.go:214-288`) — the ONLY two Go call sites of `restartServices`. Neither `db
- * start` nor `supabase start` calls any of this: it exists purely to bring the
- * satellite containers (storage/auth/realtime/pooler) back in sync with a `db`
- * container that was just recreated or force-restarted out from under them, and to
- * reload Kong's nginx so its cached upstream addresses (which may have changed if a
- * satellite container came back on a different one) stop 502ing.
+ * Satellite-container lifecycle around a `db reset`'s database recreate, on both the
+ * PG14 (DROP/CREATE in place) and PG15+ (container recreate) paths: the satellites
+ * (storage/auth/realtime/pooler) are stopped while the database is being rebuilt
+ * ({@link legacyWithSatelliteFence}) and restarted once it is back
+ * ({@link legacyRestartServicesAndReloadKong}), followed by a Kong nginx reload so
+ * its cached upstream addresses (which may have changed if a satellite came back on
+ * a different one) stop 502ing. Neither `db start` nor `supabase start` calls any of
+ * this: it exists purely to keep the satellites away from a `db` container being
+ * recreated or force-restarted out from under them.
  */
 
-import { Data, Effect, Option, Result } from "effect";
+import { Cause, Data, Effect, Option, Result } from "effect";
 import type { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
 
+import { Output } from "../../../shared/output/output.service.ts";
 import {
   actionability,
   type CliErrorActionabilityDeclaration,
   ErrorActionabilityId,
 } from "../../../shared/telemetry/error-actionability.ts";
-import { legacyAqua } from "../legacy-colors.ts";
+import { legacyAqua, legacyYellow } from "../legacy-colors.ts";
 import {
   legacyCollectText,
   legacyDescribeContainerCliFailure,
@@ -60,21 +62,25 @@ export function legacyRestartContainer(
   );
 }
 
+type SatelliteOp = "restart" | "start" | "stop";
+
 /**
- * One satellite service's restart, tolerant of "not found" (Go's `!errdefs.IsNotFound(err)`
- * guard, `reset.go:231`) — a service excluded from the stack (e.g. `[realtime] enabled =
- * false`) has no container to restart, and that's not an error. Never fails the surrounding
- * `Effect.all` itself: resolves `Option.some(message)` on a genuine failure so the caller
- * can join every service's outcome the way Go's `errors.Join(result...)` does, and
- * `Option.none()` on success OR a tolerated not-found.
+ * One satellite container's `docker restart`/`start`/`stop`, tolerant of "not found":
+ * a service excluded from the stack (e.g. `[realtime] enabled = false`) has no
+ * container to act on, and that's not an error. (`stop` on a stopped container and
+ * `start` on a running one exit 0, so neither needs extra tolerance.) Never fails the
+ * surrounding `Effect.all` itself: resolves `Option.some(message)` on a genuine
+ * failure so {@link legacySatelliteSetOp} can join every container's outcome, and
+ * `Option.none()` on success or a tolerated not-found.
  */
-const legacyRestartSatelliteService = (
+const legacySatelliteOp = (
   spawner: Spawner,
+  op: SatelliteOp,
   containerId: string,
 ): Effect.Effect<Option.Option<string>> =>
   Effect.scoped(
     Effect.gen(function* () {
-      const child = yield* spawnContainerCli(spawner, ["restart", containerId], {
+      const child = yield* spawnContainerCli(spawner, [op, containerId], {
         stdin: "ignore",
         stdout: "ignore",
         stderr: "pipe",
@@ -87,20 +93,63 @@ const legacyRestartSatelliteService = (
       const trimmed = stderr.trim();
       if (legacyIsContainerNotFoundMessage(trimmed)) return Option.none();
       return Option.some(
-        `failed to restart ${containerId}: ${trimmed.length > 0 ? trimmed : `exit ${exitCode}`}`,
+        `failed to ${op} ${containerId}: ${trimmed.length > 0 ? trimmed : `exit ${exitCode}`}`,
       );
     }),
   ).pipe(
     Effect.catch((cause) =>
       Effect.succeed(
-        Option.some(
-          `failed to restart ${containerId}: ${legacyDescribeContainerCliFailure(cause)}`,
-        ),
+        Option.some(`failed to ${op} ${containerId}: ${legacyDescribeContainerCliFailure(cause)}`),
       ),
     ),
   );
 
-/** One or more satellite-service restarts failed. Messages are newline-joined, matching Go's `errors.Join`. */
+/**
+ * The containers every op targets: the `unless-stopped` services whose boot-time
+ * migrations write to the `postgres` database. NOT PostgREST (it reconnects and
+ * re-reads the schema on its own), NOT Kong (reloaded in place, never restarted), NOT
+ * analytics (its migration lives in the separate `_supabase` database, which the
+ * one-shot migrate jobs never touch, so it just crash-loops until the reset is done —
+ * exactly as it does during `supabase start`).
+ */
+function legacySatelliteContainerIds(projectId: string): ReadonlyArray<string> {
+  return [
+    legacyServiceContainerName("storage", projectId),
+    legacyServiceContainerName("auth", projectId),
+    legacyServiceContainerName("realtime", projectId),
+    legacyServiceContainerName("pooler", projectId),
+  ];
+}
+
+/**
+ * Runs one `docker <op>` over the whole satellite set CONCURRENTLY, without waiting
+ * for anything to become healthy afterward (a service may be excluded from the
+ * stack), and joins every genuine failure into one newline-separated message.
+ */
+function legacySatelliteSetOp<E>(
+  spawner: Spawner,
+  projectId: string,
+  op: SatelliteOp,
+  onFailure: (message: string) => E,
+): Effect.Effect<void, E> {
+  return Effect.gen(function* () {
+    const results = yield* Effect.all(
+      legacySatelliteContainerIds(projectId).map((containerId) =>
+        legacySatelliteOp(spawner, op, containerId),
+      ),
+      { concurrency: "unbounded" },
+    );
+    const failures = results.filter(Option.isSome).map((result) => result.value);
+    if (failures.length > 0) {
+      return yield* Effect.fail(onFailure(failures.join("\n")));
+    }
+  });
+}
+
+/**
+ * One or more satellite-service restarts (or restore-path starts) failed; the
+ * per-container messages are newline-joined.
+ */
 export class LegacyRestartServicesError extends Data.TaggedError("LegacyRestartServicesError")<{
   readonly message: string;
 }> {
@@ -110,35 +159,42 @@ export class LegacyRestartServicesError extends Data.TaggedError("LegacyRestartS
 }
 
 /**
- * Port of Go's `restartServices` restart half (`reset.go:227-239`): restarts
- * storage/auth/realtime/pooler CONCURRENTLY (Go's `utils.WaitAll`, a goroutine per
- * service) — NOT PostgREST, which "automatically reconnects and listens for schema
- * changes" (Go's own comment) — and does NOT wait for them to become healthy
- * afterward ("those services may be excluded from starting"). Every per-service
- * failure (excluding a tolerated not-found) is joined into one newline-separated
- * message, matching `errors.Join`. Not exported outside this module — only
- * {@link legacyRestartServicesAndReloadKong} calls this directly.
+ * One or more satellite-service stops failed before the database was touched; the
+ * per-container messages are newline-joined.
  */
-function legacyRestartSatelliteServices(
+export class LegacyStopServicesError extends Data.TaggedError("LegacyStopServicesError")<{
+  readonly message: string;
+  readonly suggestion: string;
+}> {
+  get [ErrorActionabilityId](): CliErrorActionabilityDeclaration {
+    return actionability.startStack;
+  }
+}
+
+/**
+ * The pre-teardown fence (https://github.com/supabase/cli/issues/6445). An explicit
+ * `docker stop` marks each satellite manually-stopped, which disarms its
+ * `unless-stopped` restart policy; without it, a satellite that crashes when its
+ * database vanishes is auto-restarted by the daemon straight into the "Initialising
+ * schema..." window, where its boot-time migrations race the one-shot migrate jobs on
+ * the fresh database and either side can exit non-zero.
+ */
+function legacyStopSatelliteServices(
   spawner: Spawner,
   projectId: string,
-): Effect.Effect<void, LegacyRestartServicesError> {
-  const containerIds = [
-    legacyServiceContainerName("storage", projectId),
-    legacyServiceContainerName("auth", projectId),
-    legacyServiceContainerName("realtime", projectId),
-    legacyServiceContainerName("pooler", projectId),
-  ];
-  return Effect.gen(function* () {
-    const results = yield* Effect.all(
-      containerIds.map((containerId) => legacyRestartSatelliteService(spawner, containerId)),
-      { concurrency: "unbounded" },
-    );
-    const failures = results.filter(Option.isSome).map((result) => result.value);
-    if (failures.length > 0) {
-      return yield* Effect.fail(new LegacyRestartServicesError({ message: failures.join("\n") }));
-    }
-  });
+): Effect.Effect<void, LegacyStopServicesError> {
+  return legacySatelliteSetOp(
+    spawner,
+    projectId,
+    "stop",
+    (message) =>
+      new LegacyStopServicesError({
+        message,
+        suggestion: `The database was not touched. Retry the reset, or run ${legacyAqua(
+          "supabase stop",
+        )} then ${legacyAqua("supabase start")} if the container stays stuck.`,
+      }),
+  );
 }
 
 /**
@@ -204,7 +260,7 @@ function legacyExecCaptureCombined(
  * `kong reload` regenerates nginx.conf from Kong's default template and drops the
  * custom `email_templates` server, reintroducing #6059), failing hard (with the same
  * suggestion) on a non-zero exit, the combined output appended when non-empty. Not
- * exported outside this module — only {@link legacyRestartServicesAndReloadKong}
+ * exported outside this module — only {@link legacySatelliteSetOpAndReloadKong}
  * calls this directly.
  */
 function legacyReloadKong(
@@ -250,16 +306,85 @@ function legacyReloadKong(
 }
 
 /**
- * Port of Go's `restartServices` (`reset.go:227-241`): the satellite restarts above,
- * then {@link legacyReloadKong} — ONLY when every restart succeeded (Go returns the
- * joined restart error immediately, without ever attempting the Kong reload).
+ * `docker <op>` over the satellite set, then {@link legacyReloadKong} — ONLY when
+ * every satellite succeeded (the joined satellite error is returned without ever
+ * attempting the Kong reload).
  */
+function legacySatelliteSetOpAndReloadKong(
+  spawner: Spawner,
+  projectId: string,
+  op: "restart" | "start",
+): Effect.Effect<void, LegacyRestartServicesError | LegacyKongReloadError> {
+  return Effect.gen(function* () {
+    yield* legacySatelliteSetOp(
+      spawner,
+      projectId,
+      op,
+      (message) => new LegacyRestartServicesError({ message }),
+    );
+    yield* legacyReloadKong(spawner, projectId);
+  });
+}
+
+/** The post-recreate step (Go's `restartServices`, `reset.go:227-241`): restart the satellites, then reload Kong. */
 export function legacyRestartServicesAndReloadKong(
   spawner: Spawner,
   projectId: string,
 ): Effect.Effect<void, LegacyRestartServicesError | LegacyKongReloadError> {
+  return legacySatelliteSetOpAndReloadKong(spawner, projectId, "restart");
+}
+
+/**
+ * The failed-reset restore: `docker start` the fenced satellites (a no-op on one that
+ * is already running, so a partial stop is undone too), then reload Kong.
+ */
+function legacyRestoreSatelliteServices(
+  spawner: Spawner,
+  projectId: string,
+): Effect.Effect<void, LegacyRestartServicesError | LegacyKongReloadError> {
+  return legacySatelliteSetOpAndReloadKong(spawner, projectId, "start");
+}
+
+/**
+ * Runs `body` — the reset's database teardown and rebuild — with the satellites
+ * stopped ({@link legacyStopSatelliteServices}), and brings them back
+ * ({@link legacyRestoreSatelliteServices}) when it fails, so a failed reset (a bad
+ * migration or seed is the everyday case) does not leave them down. The caller
+ * restarts them itself on success, so the fence ends where that restart begins and
+ * never re-runs it — or the Kong reload — after a failure of its own.
+ *
+ * The restore also runs for a defect (a broken stderr pipe mid-reset, say), but not
+ * for a plain interruption: Ctrl-C must not be held up by four `docker start`s. When
+ * the restore itself fails, the user has to know the services are down, so say so on
+ * stderr alongside the reset's own error — the one worth reporting — instead of
+ * replacing it.
+ */
+export function legacyWithSatelliteFence<A, E, R>(
+  spawner: Spawner,
+  projectId: string,
+  body: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E | LegacyStopServicesError, R | Output> {
+  const warn = (text: string) =>
+    Effect.gen(function* () {
+      const output = yield* Output;
+      yield* output.raw(`${legacyYellow("WARNING:")} ${text}\n`, "stderr");
+    });
   return Effect.gen(function* () {
-    yield* legacyRestartSatelliteServices(spawner, projectId);
-    yield* legacyReloadKong(spawner, projectId);
-  });
+    yield* legacyStopSatelliteServices(spawner, projectId);
+    return yield* body;
+  }).pipe(
+    Effect.tapCauseIf(
+      (cause) => !Cause.hasInterruptsOnly(cause),
+      () =>
+        legacyRestoreSatelliteServices(spawner, projectId).pipe(
+          Effect.catchTags({
+            LegacyRestartServicesError: (error) =>
+              warn(
+                `the local services could not be restarted after the failed reset: ${error.message}\nRun ${legacyAqua("supabase stop")} then ${legacyAqua("supabase start")} to bring them back.`,
+              ),
+            LegacyKongReloadError: (error) => warn(`${error.message}\n${error.suggestion}`),
+          }),
+        ),
+    ),
+  );
 }

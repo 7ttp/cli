@@ -1,12 +1,15 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Sink, Stream } from "effect";
+import { Cause, Data, Deferred, Effect, Exit, Sink, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
+import { mockOutput } from "../../../../tests/helpers/mocks.ts";
 import {
   LegacyContainerRestartError,
   LegacyKongReloadError,
+  LegacyStopServicesError,
   legacyRestartContainer,
   legacyRestartServicesAndReloadKong,
+  legacyWithSatelliteFence,
 } from "./restart-services.ts";
 
 /** Matches the standing `mockSpawner` shape used across `legacy-docker-*.unit.test.ts` files. */
@@ -129,7 +132,7 @@ describe("legacyRestartServicesAndReloadKong", () => {
             if (inFlight === 4) yield* Deferred.succeed(barrier, undefined);
             // Every one of the four restarts blocks here until ALL FOUR are in flight
             // simultaneously (Go's `utils.WaitAll`, a goroutine per service — reset.go:259-271).
-            // If `legacyRestartSatelliteServices` ever regressed to a sequential restart (e.g.
+            // If `legacySatelliteSetOp` ever regressed to a sequential restart (e.g.
             // `concurrency: 1`), the second restart would never even be DISPATCHED until the
             // first resolves, so `inFlight` would never reach 4 and this `await` would hang
             // forever, timing out the test instead of silently passing.
@@ -301,6 +304,234 @@ describe("legacyRestartServicesAndReloadKong", () => {
           "/home/kong/custom_nginx.template",
         ]);
       }),
+    );
+  });
+});
+
+describe("legacyWithSatelliteFence", () => {
+  const PROJECT_ID = "proj";
+  const KONG_RELOAD = [
+    "exec",
+    "supabase_kong_proj",
+    "kong",
+    "reload",
+    "--nginx-conf",
+    "/home/kong/custom_nginx.template",
+  ];
+  const SATELLITES = [
+    "supabase_storage_proj",
+    "supabase_auth_proj",
+    "supabase_realtime_proj",
+    "supabase_pooler_proj",
+  ];
+
+  class BodyError extends Data.TaggedError("BodyError")<{ readonly message: string }> {}
+
+  const ids = (spawned: ReadonlyArray<ReadonlyArray<string>>, op: string) =>
+    spawned.filter((args) => args[0] === op).map((args) => args[1]);
+
+  /** Every docker call succeeds and Kong is running, so a restore reaches the Kong reload. */
+  const stackUp = (args: ReadonlyArray<string>) =>
+    args[0] === "container" && args[1] === "inspect"
+      ? { exitCode: 0, stdout: HEALTHY_STATE }
+      : { exitCode: 0 };
+
+  it.live(
+    "stops the four satellites before the body runs and leaves the restart to the caller",
+    () => {
+      const mock = mockSpawner(stackUp);
+      const out = mockOutput();
+      let spawnedBeforeBody: ReadonlyArray<ReadonlyArray<string>> = [];
+      return legacyWithSatelliteFence(
+        mock.spawner,
+        PROJECT_ID,
+        Effect.sync(() => {
+          spawnedBeforeBody = [...mock.spawned];
+          return "done";
+        }),
+      ).pipe(
+        Effect.map((result) => {
+          expect(result).toBe("done");
+          expect(ids(spawnedBeforeBody, "stop")).toEqual(expect.arrayContaining(SATELLITES));
+          expect(spawnedBeforeBody).toHaveLength(4);
+          // Success is the caller's to finish: no restore, no restart, no Kong reload from the fence.
+          expect(mock.spawned).toEqual(spawnedBeforeBody);
+          expect(out.stderrText).toBe("");
+        }),
+        Effect.provide(out.layer),
+      );
+    },
+  );
+
+  it.live('tolerates a "not found" satellite stop — excluded services have no container', () => {
+    const mock = mockSpawner((args) => {
+      if (args[0] === "stop" && args[1] === "supabase_realtime_proj") {
+        return { exitCode: 1, stderr: "Error: No such container: supabase_realtime_proj\n" };
+      }
+      return { exitCode: 0 };
+    });
+    const out = mockOutput();
+    return legacyWithSatelliteFence(mock.spawner, PROJECT_ID, Effect.succeed("done")).pipe(
+      Effect.map((result) => {
+        expect(result).toBe("done");
+        expect(ids(mock.spawned, "start")).toEqual([]);
+      }),
+      Effect.provide(out.layer),
+    );
+  });
+
+  it.live(
+    "a stop failure fails with the joined LegacyStopServicesError, skips the body, and undoes the partial stop",
+    () => {
+      const mock = mockSpawner((args) => {
+        if (args[0] === "stop" && args[1] === "supabase_storage_proj") {
+          return { exitCode: 1, stderr: "boom-storage" };
+        }
+        if (args[0] === "stop" && args[1] === "supabase_pooler_proj") {
+          return { exitCode: 1, stderr: "boom-pooler" };
+        }
+        return stackUp(args);
+      });
+      const out = mockOutput();
+      let bodyRan = false;
+      return legacyWithSatelliteFence(
+        mock.spawner,
+        PROJECT_ID,
+        Effect.sync(() => {
+          bodyRan = true;
+        }),
+      ).pipe(
+        Effect.flip,
+        Effect.map((error) => {
+          expect(error).toBeInstanceOf(LegacyStopServicesError);
+          expect(error.message).toContain("failed to stop supabase_storage_proj");
+          expect(error.message).toContain("failed to stop supabase_pooler_proj");
+          expect(error.suggestion).toContain("The database was not touched.");
+          expect(bodyRan).toBe(false);
+          expect(ids(mock.spawned, "start")).toEqual(expect.arrayContaining(SATELLITES));
+          expect(ids(mock.spawned, "start")).toHaveLength(4);
+          expect(mock.spawned).toContainEqual(KONG_RELOAD);
+        }),
+        Effect.provide(out.layer),
+      );
+    },
+  );
+
+  it.live(
+    "a body failure `docker start`s the four satellites (never `restart`), reloads Kong, and propagates the body's own error",
+    () => {
+      const mock = mockSpawner(stackUp);
+      const out = mockOutput();
+      return legacyWithSatelliteFence(
+        mock.spawner,
+        PROJECT_ID,
+        Effect.fail(new BodyError({ message: "migration exploded" })),
+      ).pipe(
+        Effect.flip,
+        Effect.map((error) => {
+          expect(error).toBeInstanceOf(BodyError);
+          expect(ids(mock.spawned, "start")).toEqual(expect.arrayContaining(SATELLITES));
+          expect(ids(mock.spawned, "start")).toHaveLength(4);
+          expect(ids(mock.spawned, "restart")).toEqual([]);
+          expect(mock.spawned.filter((args) => args[0] === "exec")).toEqual([KONG_RELOAD]);
+          expect(out.stderrText).toBe("");
+        }),
+        Effect.provide(out.layer),
+      );
+    },
+  );
+
+  it.live(
+    "a failed restore is a stderr WARNING beside the body's error, and Kong is left alone",
+    () => {
+      const mock = mockSpawner((args) => {
+        if (args[0] === "start" && args[1] === "supabase_auth_proj") {
+          return { exitCode: 1, stderr: "boom-auth" };
+        }
+        return { exitCode: 0 };
+      });
+      const out = mockOutput();
+      return legacyWithSatelliteFence(
+        mock.spawner,
+        PROJECT_ID,
+        Effect.fail(new BodyError({ message: "migration exploded" })),
+      ).pipe(
+        Effect.flip,
+        Effect.map((error) => {
+          expect(error).toBeInstanceOf(BodyError);
+          expect(ids(mock.spawned, "exec")).toEqual([]);
+          // Styled tokens (`WARNING:`, the commands) are asserted separately from the plain text.
+          expect(out.stderrText).toContain("WARNING:");
+          expect(out.stderrText).toContain(
+            "the local services could not be restarted after the failed reset: failed to start supabase_auth_proj: boom-auth",
+          );
+          expect(out.stderrText).toContain("supabase stop");
+          expect(out.stderrText).toContain("supabase start");
+          expect(out.stderrText).toContain("to bring them back.");
+        }),
+        Effect.provide(out.layer),
+      );
+    },
+  );
+
+  it.live(
+    "a failed Kong reload after the restore is a stderr WARNING carrying its recovery hint",
+    () => {
+      const mock = mockSpawner((args) => {
+        if (args[0] === "exec") return { exitCode: 1, stdout: "nginx: [emerg] bad config\n" };
+        return stackUp(args);
+      });
+      const out = mockOutput();
+      return legacyWithSatelliteFence(
+        mock.spawner,
+        PROJECT_ID,
+        Effect.fail(new BodyError({ message: "migration exploded" })),
+      ).pipe(
+        Effect.flip,
+        Effect.map((error) => {
+          expect(error).toBeInstanceOf(BodyError);
+          expect(ids(mock.spawned, "start")).toHaveLength(4);
+          expect(out.stderrText).toContain("WARNING:");
+          expect(out.stderrText).toContain(
+            "failed to reload kong: error executing command:\nnginx: [emerg] bad config",
+          );
+          expect(out.stderrText).toContain("API routes may return 502 until the gateway reloads.");
+          expect(out.stderrText).toContain("docker restart supabase_kong_proj");
+        }),
+        Effect.provide(out.layer),
+      );
+    },
+  );
+
+  it.live(
+    "an interrupted body (Ctrl-C) is not restored — the stack is left for `supabase stop`",
+    () => {
+      const mock = mockSpawner(() => ({ exitCode: 0 }));
+      const out = mockOutput();
+      return legacyWithSatelliteFence(mock.spawner, PROJECT_ID, Effect.interrupt).pipe(
+        Effect.exit,
+        Effect.map((exit) => {
+          expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
+          expect(ids(mock.spawned, "start")).toEqual([]);
+          expect(ids(mock.spawned, "exec")).toEqual([]);
+          expect(out.stderrText).toBe("");
+        }),
+        Effect.provide(out.layer),
+      );
+    },
+  );
+
+  it.live("a defect inside the body still restores the satellites", () => {
+    const mock = mockSpawner(stackUp);
+    const out = mockOutput();
+    return legacyWithSatelliteFence(mock.spawner, PROJECT_ID, Effect.die("broken pipe")).pipe(
+      Effect.exit,
+      Effect.map((exit) => {
+        expect(Exit.hasDies(exit)).toBe(true);
+        expect(ids(mock.spawned, "start")).toHaveLength(4);
+        expect(mock.spawned).toContainEqual(KONG_RELOAD);
+      }),
+      Effect.provide(out.layer),
     );
   });
 });

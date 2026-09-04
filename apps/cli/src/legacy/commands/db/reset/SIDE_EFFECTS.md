@@ -11,7 +11,7 @@ stack) is ALSO fully native (CLI-1955 removed the hidden Go `db __db-bootstrap` 
 this used to delegate to): the running check, the PG14/PG15 container-recreate
 composition (`legacy/shared/db-bootstrap/recreate-local-database.ts`, reusing the
 same container-bootstrap primitives `db start` uses — see that command's own
-`SIDE_EFFECTS.md`), the post-recreate satellite-restart + Kong reload
+`SIDE_EFFECTS.md`), the satellite fence and post-recreate restart + Kong reload
 (`legacy/shared/db-bootstrap/restart-services.ts`), the storage-health gate
 (`legacy/shared/db-bootstrap/await-storage-ready.ts`), bucket seeding, and the
 git-branch line are all native TS — including the local target's own
@@ -59,16 +59,18 @@ equivalent, PG15) or `InitSchema14`/`ApplyApiPrivileges` (PG14).
 
 ## Subprocesses
 
-| Command                                                                                                                      | When                                  | Purpose                                                                                                                                                                                                                                                   |
-| ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `docker container inspect supabase_db_<project>`                                                                             | local path                            | `AssertSupabaseDbIsRunning` probe (Podman fallback)                                                                                                                                                                                                       |
-| `docker container rm -f supabase_db_<project>` / `docker volume rm -f <same>`                                                | local path, PG15                      | remove the existing container/volume before recreating (Podman fallback)                                                                                                                                                                                  |
-| `docker network create` / `docker volume create` / `docker create` / `docker start`                                          | local path, PG15                      | recreate the Postgres container (same primitives `db start` uses)                                                                                                                                                                                         |
-| `docker run --rm <realtime\|storage\|gotrue image>`                                                                          | local path, PG15, per enabled service | the one-shot `initSchema15` migrate jobs (`legacyStartSetupLocalDatabase`)                                                                                                                                                                                |
-| `docker restart <db container>`                                                                                              | local path, PG14                      | `RestartDatabase` — pg_cron must restart after `pg_terminate_backend`                                                                                                                                                                                     |
-| `docker restart <storage\|auth\|realtime\|pooler container>`                                                                 | local path, both PG14 and PG15        | concurrent satellite-container restart, not-found tolerated per service                                                                                                                                                                                   |
-| `docker container inspect <kong container>` + `docker exec <kong> kong reload --nginx-conf /home/kong/custom_nginx.template` | local path, both PG14 and PG15        | reload Kong so it re-resolves the restarted containers' addresses (issue #6016) — the `--nginx-conf` flag is load-bearing: a bare `kong reload` regenerates nginx.conf from Kong's default template and drops the custom `email_templates` server (#6059) |
-| `docker container inspect supabase_storage_<project>`                                                                        | local path                            | storage-health gate before bucket seeding                                                                                                                                                                                                                 |
+| Command                                                                                                                      | When                                    | Purpose                                                                                                                                                                                                                                                   |
+| ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker container inspect supabase_db_<project>`                                                                             | local path                              | `AssertSupabaseDbIsRunning` probe (Podman fallback)                                                                                                                                                                                                       |
+| `docker stop <storage\|auth\|realtime\|pooler container>`                                                                    | local path, both PG14 and PG15, first   | pre-teardown fence (#6445): disarms `unless-stopped` so no satellite crash-restarts into the init window; concurrent, not-found tolerated per service; a genuine failure aborts before anything is destroyed                                              |
+| `docker container rm -f supabase_db_<project>` / `docker volume rm -f <same>`                                                | local path, PG15                        | remove the existing container/volume before recreating (Podman fallback)                                                                                                                                                                                  |
+| `docker network create` / `docker volume create` / `docker create` / `docker start`                                          | local path, PG15                        | recreate the Postgres container (same primitives `db start` uses)                                                                                                                                                                                         |
+| `docker run --rm <realtime\|storage\|gotrue image>`                                                                          | local path, PG15, per enabled service   | the one-shot `initSchema15` migrate jobs (`legacyStartSetupLocalDatabase`)                                                                                                                                                                                |
+| `docker restart <db container>`                                                                                              | local path, PG14                        | `RestartDatabase` — pg_cron must restart after `pg_terminate_backend`                                                                                                                                                                                     |
+| `docker restart <storage\|auth\|realtime\|pooler container>`                                                                 | local path, both PG14 and PG15          | concurrent satellite-container restart, not-found tolerated per service                                                                                                                                                                                   |
+| `docker start <storage\|auth\|realtime\|pooler container>`                                                                   | local path, on failure inside the fence | bring the stopped satellites back (a partial stop included), then the Kong reload below; a failure of either only warns                                                                                                                                   |
+| `docker container inspect <kong container>` + `docker exec <kong> kong reload --nginx-conf /home/kong/custom_nginx.template` | local path, both PG14 and PG15          | reload Kong so it re-resolves the restarted containers' addresses (issue #6016) — the `--nginx-conf` flag is load-bearing: a bare `kong reload` regenerates nginx.conf from Kong's default template and drops the custom `email_templates` server (#6059) |
+| `docker container inspect supabase_storage_<project>`                                                                        | local path                              | storage-health gate before bucket seeding                                                                                                                                                                                                                 |
 
 No subprocess delegation remains on either target — the remote path's
 `--experimental` schema-files apply (formerly delegated to a `supabase-go db reset`
@@ -88,6 +90,13 @@ child) is fully native as of CLI-1958.
 | `SET SESSION ROLE postgres`                                                                                                                      | stepped-down sessions only: after each role-reverting statement, at end of each file, before ledger writes |
 
 ### Local path (native, in TS)
+
+**Both branches** first stop the storage/auth/realtime/pooler containers (the
+pre-teardown fence, #6445 — see "Subprocesses"); the database is not touched until
+every stop has succeeded or been tolerated, and a genuine stop failure is reported with
+a `Suggestion:` saying so. The fence covers the database work only — through
+`MigrateAndSeed` on PG15+, through the `db` container's post-restart health wait on
+PG14 — and ends where the satellite restarts below begin.
 
 **PG15+:** the container/volume are removed and recreated (see "Subprocesses"), then
 the reused `legacyStartSetupLocalDatabase` pipeline runs the initial schema (as
@@ -114,6 +123,16 @@ re-resolves the restarted containers' addresses — otherwise routes to a moved
 container keep returning 502 after the reset succeeds (issue #6016). **A Kong reload
 failure fails the WHOLE command** (unlike `functions serve`'s best-effort reload),
 with an actionable `Suggestion:` line (`docker restart <kong>` / `docker logs <kong>`).
+If the reset fails inside the fence (on PG15+ a failing migration or seed is the
+everyday case), the stopped satellites are `docker start`ed again and Kong is
+reloaded, silently, before the error is reported, so a failed reset does not leave
+them stopped; when that restore itself fails, a `WARNING:` line on stderr names the
+failure (a failed start points at `supabase stop` then `supabase start`; a failed
+Kong reload carries its own `docker restart <kong>` hint), and the reset's own error is
+still the one reported. A failure of the satellite restarts or the Kong reload
+themselves is reported as is — the satellites are no longer stopped, so there is
+nothing to restore. An interrupt (Ctrl-C) does not restore them — run
+`supabase db reset` again, or `supabase stop` then `supabase start`.
 Bucket objects are then seeded over the Storage gateway (reusing the `seed buckets`
 local path), gated on a native storage-health check: absent (any inspect error, not
 just "not found") skips buckets without failing; present-but-unhealthy waits up to a
@@ -157,20 +176,20 @@ echoed, because those may genuinely have reached the server.
 
 ## Exit Codes
 
-| Code | Condition                                                                                                                                  |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `0`  | success                                                                                                                                    |
-| `1`  | mutually exclusive target flags (`[db-url linked local]`)                                                                                  |
-| `1`  | `--version` + `--last` together (`[last version]`)                                                                                         |
-| `1`  | `--version` not an integer (`invalid version number`)                                                                                      |
-| `1`  | `--version` has no matching migration file                                                                                                 |
-| `1`  | local: database not running (`supabase start is not running.`)                                                                             |
-| `1`  | user declined the reset confirmation (`context canceled`)                                                                                  |
-| `1`  | `config.toml` parse failure                                                                                                                |
-| `1`  | drop / migrate / seed / vault apply failure, or connection error                                                                           |
-| `1`  | no `[db.migrations].schema_paths` pattern matched anything on the `--experimental` branch, either target                                   |
-| `1`  | local: container/volume remove, network/volume/container create, health-check timeout, PG14 SQL, satellite-restart, or Kong-reload failure |
-| `1`  | `--project-ref` set with a resolved target other than linked (see Notes)                                                                   |
+| Code | Condition                                                                                                                                                  |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | success                                                                                                                                                    |
+| `1`  | mutually exclusive target flags (`[db-url linked local]`)                                                                                                  |
+| `1`  | `--version` + `--last` together (`[last version]`)                                                                                                         |
+| `1`  | `--version` not an integer (`invalid version number`)                                                                                                      |
+| `1`  | `--version` has no matching migration file                                                                                                                 |
+| `1`  | local: database not running (`supabase start is not running.`)                                                                                             |
+| `1`  | user declined the reset confirmation (`context canceled`)                                                                                                  |
+| `1`  | `config.toml` parse failure                                                                                                                                |
+| `1`  | drop / migrate / seed / vault apply failure, or connection error                                                                                           |
+| `1`  | no `[db.migrations].schema_paths` pattern matched anything on the `--experimental` branch, either target                                                   |
+| `1`  | local: satellite-stop, container/volume remove, network/volume/container create, health-check timeout, PG14 SQL, satellite-restart, or Kong-reload failure |
+| `1`  | `--project-ref` set with a resolved target other than linked (see Notes)                                                                                   |
 
 There is no remaining Go child on either target (CLI-1955 removed it for local,
 CLI-1958 for remote) — every failure is a native, typed TS error surfaced as `1`.

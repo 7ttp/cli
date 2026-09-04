@@ -160,9 +160,9 @@ export function legacyCollectText(stream: Stream.Stream<Uint8Array, unknown>) {
  * own (now-removed) local `isContainerNotFoundMessage` used to draw. Hoisted here (rather than
  * left as separate per-caller copies) so every container-not-found check across the
  * container-lifecycle/start/restart/health-check domain (`legacyIsLocalDbRunning`,
- * `legacyRestartSatelliteService`, `legacyReloadKong`, …) shares one predicate instead of
- * re-deriving the same match with different Podman coverage — a reset excluding a satellite
- * service (storage/auth/realtime/pooler) or Kong would otherwise report a hard restart/reload
+ * `legacySatelliteOp`, `legacyReloadKong`, …) shares one predicate instead of re-deriving
+ * the same match with different Podman coverage — a reset excluding a satellite service
+ * (storage/auth/realtime/pooler) or Kong would otherwise report a hard stop/restart/reload
  * failure instead of tolerating the absent container.
  */
 export function legacyIsContainerNotFoundMessage(message: string): boolean {

@@ -340,7 +340,7 @@ export const legacyCreateShadowDatabase = (
  * container CLI missing, a disconnected runtime, a stream-read error) — Go's single
  * `Docker.ContainerRemove` SDK call folds every one of those causes into the same `err` it
  * prints, so this catches {@link spawnContainerCli}/exit-code-collection failures the same way
- * {@link legacyRestartSatelliteService} does (`restart-services.ts`), via
+ * `restart-services.ts`'s `legacySatelliteOp` does, via
  * {@link legacyDescribeContainerCliFailure}, rather than discarding them unreported.
  */
 export const legacyRemoveShadowDatabase = (

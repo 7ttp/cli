@@ -44,7 +44,7 @@ formatting without disabling safe compaction.
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
 | Natively-provisioned shadow Postgres container (create, health-wait, platform-baseline setup via one-shot auth/storage/realtime migrate jobs, then remove) — the same primitives `db diff`/`db pull` use for their own shadow, exports the baseline catalog | legacy opt-out only                                            |
 | Edge-runtime container (`supabase/edge-runtime`) running the pg-delta declarative-export Deno script (host network, deno-cache volume `supabase_edge_runtime_<projectId>`)                                                                                  | legacy opt-out only                                            |
-| `docker`/`podman` container recreate for the local `db` (+ satellite restarts, Kong reload) — the same primitives `db start`/`db reset` use, via `legacyResetLocalDatabase`                                                                                 | smart-mode Local choice when reset is confirmed (or `--reset`) |
+| `docker`/`podman` container recreate for the local `db` (+ satellite stops before, restarts and Kong reload after) — the same primitives `db start`/`db reset` use, via `legacyResetLocalDatabase`                                                          | smart-mode Local choice when reset is confirmed (or `--reset`) |
 
 ## Environment Variables
 
