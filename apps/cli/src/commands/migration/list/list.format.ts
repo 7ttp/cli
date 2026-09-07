@@ -1,8 +1,6 @@
 import {
-  LEGACY_MIGRATION_VERSION_MAX,
   legacyFormatTimestampVersion,
-  legacyParseMigrationVersion,
-  legacySortMigrationVersions,
+  legacyOrderMigrationVersions,
 } from "../../../command-internal/legacy-migration-timestamp.format.ts";
 
 /** A merged local/remote migration row. `local`/`remote` are empty when absent. */
@@ -21,48 +19,42 @@ export function legacyMakeMigrationListRows(
   remote: ReadonlyArray<string>,
   local: ReadonlyArray<string>,
 ): ReadonlyArray<LegacyMigrationListRow> {
-  // `legacyLoadLocalVersions` yields versions in file-name order, which reverses
-  // `ORDER BY version` whenever one version is a prefix of another
-  // (supabase/cli#6036), desynchronising the walk into duplicate half-empty rows.
-  const sortedLocal = legacySortMigrationVersions(local);
+  // Neither side arrives in the integer order this walk compares them in —
+  // `ORDER BY version` is a `text` sort and `legacyLoadLocalVersions` yields
+  // file-name order — so an unordered walk splits a version applied on both
+  // sides into duplicate half-empty rows (supabase/cli#6036).
+  const sortedRemote = legacyOrderMigrationVersions(remote);
+  const sortedLocal = legacyOrderMigrationVersions(local);
   const rows: Array<LegacyMigrationListRow> = [];
   let i = 0;
   let j = 0;
-  while (i < remote.length || j < sortedLocal.length) {
-    let remoteTs = LEGACY_MIGRATION_VERSION_MAX;
-    if (i < remote.length) {
-      const parsed = legacyParseMigrationVersion(remote[i]!);
-      if (parsed === undefined) {
-        i++;
-        continue;
-      }
-      remoteTs = parsed;
-    }
-    let localTs = LEGACY_MIGRATION_VERSION_MAX;
-    if (j < sortedLocal.length) {
-      const parsed = legacyParseMigrationVersion(sortedLocal[j]!);
-      if (parsed === undefined) {
-        j++;
-        continue;
-      }
-      localTs = parsed;
-    }
-    if (localTs < remoteTs) {
-      rows.push({
-        local: sortedLocal[j]!,
-        remote: "",
-        time: legacyFormatTimestampVersion(sortedLocal[j]!),
-      });
+  while (i < sortedRemote.length || j < sortedLocal.length) {
+    const remoteEntry = sortedRemote[i];
+    const localEntry = sortedLocal[j];
+    if (
+      localEntry !== undefined &&
+      (remoteEntry === undefined || localEntry.value < remoteEntry.value)
+    ) {
+      const version = localEntry.version;
+      rows.push({ local: version, remote: "", time: legacyFormatTimestampVersion(version) });
       j++;
-    } else if (remoteTs < localTs) {
-      rows.push({ local: "", remote: remote[i]!, time: legacyFormatTimestampVersion(remote[i]!) });
+    } else if (
+      remoteEntry !== undefined &&
+      (localEntry === undefined || remoteEntry.value < localEntry.value)
+    ) {
+      const version = remoteEntry.version;
+      rows.push({ local: "", remote: version, time: legacyFormatTimestampVersion(version) });
       i++;
     } else {
-      rows.push({
-        local: sortedLocal[j]!,
-        remote: remote[i]!,
-        time: legacyFormatTimestampVersion(remote[i]!),
-      });
+      // Equal values, so both sides are present: the loop runs only while one
+      // of them is, and the branches above take every exhausted-side case.
+      if (localEntry !== undefined && remoteEntry !== undefined) {
+        rows.push({
+          local: localEntry.version,
+          remote: remoteEntry.version,
+          time: legacyFormatTimestampVersion(remoteEntry.version),
+        });
+      }
       i++;
       j++;
     }

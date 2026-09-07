@@ -70,6 +70,47 @@ describe("legacyReconcileMigrations", () => {
     ).toEqual({ kind: "in-sync" });
   });
 
+  it("keeps a short version out of the suggestion when a timestamp follows it", () => {
+    // Local arrives in file-name order, where `20260101000000_b.sql` precedes
+    // `202_a.sql` ('6' < '_'), while the walk compares versions as integers.
+    // Ordered as text, the walk desynchronises and names `203` — applied on
+    // both sides — as both reverted and applied.
+    const result = legacyReconcileMigrations(
+      ["201", "202", "203"],
+      ["201", "20260101000000", "202", "203"],
+    );
+    expect(result.kind).toBe("conflict");
+    if (result.kind === "conflict") {
+      const suggestion = stripAnsi(result.suggestion);
+      expect(suggestion).toContain("supabase migration repair --status applied 20260101000000");
+      expect(suggestion).not.toContain("203");
+    }
+  });
+
+  it("reports only the extra remote timestamp when local stops at a short version", () => {
+    const result = legacyReconcileMigrations(
+      ["201", "202", "20260101000000", "203"],
+      ["201", "202", "203"],
+    );
+    expect(result.kind).toBe("conflict");
+    if (result.kind === "conflict") {
+      const suggestion = stripAnsi(result.suggestion);
+      expect(suggestion).toContain("supabase migration repair --status reverted 20260101000000");
+      expect(suggestion).not.toContain("203");
+    }
+  });
+
+  it("is in sync when short versions and timestamps interleave", () => {
+    // Local arrives in file-name order, where `20260101000000_b.sql` precedes
+    // `202_a.sql` ('6' < '_'); remote arrives in text order, where it does not.
+    expect(
+      legacyReconcileMigrations(
+        ["201", "202", "20260101000000", "203"],
+        ["201", "20260101000000", "202", "203"],
+      ),
+    ).toEqual({ kind: "in-sync" });
+  });
+
   it("skips versions that do not parse as integers", () => {
     // A non-numeric remote version is skipped (Go's Atoi-error continue), leaving
     // the numeric ones in sync.
@@ -91,6 +132,13 @@ describe("legacyReconcileMigrations", () => {
     // so Go's strconv.Atoi accepts it and surfaces it as an extra-remote conflict.
     // A Number-based parser would skip it (initial pull); BigInt compares exactly.
     expect(legacyReconcileMigrations(["9999999999999999"], []).kind).toBe("conflict");
+  });
+
+  it("reports the largest in-range version as a conflict, not an empty history", () => {
+    // 9223372036854775807 is the parser's upper bound, which the walk also used
+    // as its exhausted-side pin, so this version used to cancel itself out.
+    expect(legacyReconcileMigrations(["9223372036854775807"], []).kind).toBe("conflict");
+    expect(legacyReconcileMigrations([], ["9223372036854775807"]).kind).toBe("conflict");
   });
 
   it("skips a version beyond Go's int64 range instead of hanging the scan", () => {

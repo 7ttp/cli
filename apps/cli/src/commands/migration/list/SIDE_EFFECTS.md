@@ -49,6 +49,8 @@ Remote column).
 
 Emits `output.success("Migrations listed", { migrations: [{ local, remote, time }] })`.
 `local`/`remote` are empty strings when a version exists only on the other side.
+Rows are ordered by the version's integer value; versions that are not integers
+are omitted.
 
 ### `--output-format stream-json`
 

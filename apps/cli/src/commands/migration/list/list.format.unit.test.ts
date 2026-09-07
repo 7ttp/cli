@@ -26,6 +26,27 @@ describe("legacyMakeMigrationListRows", () => {
     ]);
   });
 
+  it("orders local-only versions numerically, not by text", () => {
+    // Local versions arrive in file-name order, where `20260101000000_b.sql`
+    // precedes `203_a.sql` ('2' < '3'), and the walk compares integers, so the
+    // column has to be ordered by that same integer value.
+    expect(legacyMakeMigrationListRows([], ["20260101000000", "203"])).toEqual([
+      { local: "203", remote: "", time: "203" },
+      { local: "20260101000000", remote: "", time: "2026-01-01 00:00:00" },
+    ]);
+  });
+
+  it("pairs a short version that a timestamp outranks in text order", () => {
+    // `ORDER BY version` returns `20260101000000` before `203` (text order),
+    // while the walk compares integers. Unordered, `203` is applied on both
+    // sides yet renders as two half-empty rows.
+    expect(legacyMakeMigrationListRows(["201", "20260101000000", "203"], ["201", "203"])).toEqual([
+      { local: "201", remote: "201", time: "201" },
+      { local: "203", remote: "203", time: "203" },
+      { local: "", remote: "20260101000000", time: "2026-01-01 00:00:00" },
+    ]);
+  });
+
   it("pairs an 8-digit and a 14-digit version that share a prefix (#6036)", () => {
     // Local versions arrive in file-name order, where `20260420010000_b.sql`
     // precedes `20260420_a.sql` ('0' < '_') — the reverse of the `ORDER BY
@@ -36,6 +57,15 @@ describe("legacyMakeMigrationListRows", () => {
     ).toEqual([
       { local: "20260420", remote: "20260420", time: "20260420" },
       { local: "20260420010000", remote: "20260420010000", time: "2026-04-20 01:00:00" },
+    ]);
+  });
+
+  it("renders the largest in-range version instead of dropping it", () => {
+    expect(legacyMakeMigrationListRows(["9223372036854775807"], [])).toEqual([
+      { local: "", remote: "9223372036854775807", time: "9223372036854775807" },
+    ]);
+    expect(legacyMakeMigrationListRows([], ["9223372036854775807"])).toEqual([
+      { local: "9223372036854775807", remote: "", time: "9223372036854775807" },
     ]);
   });
 

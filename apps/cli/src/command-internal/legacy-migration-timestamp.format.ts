@@ -40,10 +40,7 @@ export function legacyFormatTimestampVersion(version: string): string {
   return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
 }
 
-/**
- * Go's `math.MaxInt` on a 64-bit build (== `math.MaxInt64`) — the sentinel that
- * pins the exhausted side of a migration-version two-pointer merge.
- */
+/** The upper bound a migration version may parse to (`math.MaxInt64`). */
 export const LEGACY_MIGRATION_VERSION_MAX = 9223372036854775807n;
 
 /** Go's `math.MinInt64` — `strconv.Atoi`'s lower bound (`ParseInt(s, 10, 0)`). */
@@ -69,19 +66,34 @@ export const legacyParseMigrationVersion = (value: string): bigint | undefined =
     : parsed;
 };
 
-/** Lexical version order, shared by every version sorter so the walks cannot drift apart. */
+/** Lexical version order, for the walks that compare versions as strings throughout. */
 export const legacyCompareMigrationVersions = (a: string, b: string): number =>
   a < b ? -1 : a > b ? 1 : 0;
 
+/** A migration version with its parsed integer value, as the numeric walks consume it. */
+export interface LegacyOrderedMigrationVersion {
+  readonly version: string;
+  readonly value: bigint;
+}
+
 /**
- * Orders bare version strings the way `ORDER BY version` returns them, for the
- * walks that compare version lists rather than paths. `version` is a `text`
- * column, so Postgres orders it lexically and a prefix always precedes its
- * extension — exactly what `legacySortMigrationPathsByVersion`
- * (`legacy-migration-history.ts`) reproduces for the path-shaped walks.
+ * Orders bare version strings the way the two-pointer walks *compare* them: by
+ * parsed integer value. Neither input arrives in that order — `ORDER BY version`
+ * is a `text` sort and `legacyLoadLocalVersions` yields file-name order — and
+ * text order contradicts numeric order as soon as the widths differ
+ * (`"20260101000000" < "203"` as text, the reverse as integers), which
+ * desynchronises the walk. Versions that are not valid integers are dropped.
+ *
+ * Path-shaped walks compare versions as strings throughout and stay on
+ * `legacySortMigrationPathsByVersion` (`legacy-migration-history.ts`).
  */
-export function legacySortMigrationVersions(
+export function legacyOrderMigrationVersions(
   versions: ReadonlyArray<string>,
-): ReadonlyArray<string> {
-  return [...versions].sort(legacyCompareMigrationVersions);
+): ReadonlyArray<LegacyOrderedMigrationVersion> {
+  return versions
+    .flatMap((version) => {
+      const value = legacyParseMigrationVersion(version);
+      return value === undefined ? [] : [{ version, value }];
+    })
+    .sort((a, b) => (a.value < b.value ? -1 : a.value > b.value ? 1 : 0));
 }

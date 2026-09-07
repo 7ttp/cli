@@ -6,10 +6,8 @@ import { legacyCompareUtf8Bytes } from "./legacy-glob.ts";
 import type { LegacyDbExecError } from "./legacy-db-connection.errors.ts";
 import type { LegacyDbSession } from "./legacy-db-connection.service.ts";
 import {
-  LEGACY_MIGRATION_VERSION_MAX,
   legacyCompareMigrationVersions,
-  legacyParseMigrationVersion,
-  legacySortMigrationVersions,
+  legacyOrderMigrationVersions,
 } from "./legacy-migration-timestamp.format.ts";
 import { LegacyMigrationsReadError } from "./legacy-migration.errors.ts";
 import { legacyParseMigrationContent } from "./legacy-migration-file.ts";
@@ -180,54 +178,39 @@ export type LegacyMigrationSync =
   | { readonly kind: "conflict"; readonly suggestion: string };
 
 /**
- * Reconciles the remote and local migration version lists. Pure port of Go's
- * `assertRemoteInSync` two-pointer comparison:
- * versions that fail to parse as integers are skipped (`Atoi` error →
- * `continue`); any extra remote/local version is a conflict; an empty local set
- * is `missing`; otherwise in-sync.
+ * Reconciles the remote and local migration version lists with a two-pointer
+ * comparison: versions that fail to parse as integers are dropped; any extra
+ * remote/local version is a conflict; an empty local set is `missing`;
+ * otherwise in-sync.
  */
 export function legacyReconcileMigrations(
   remote: ReadonlyArray<string>,
   local: ReadonlyArray<string>,
   isLocal = false,
 ): LegacyMigrationSync {
-  // `LEGACY_MIGRATION_VERSION_MAX` is `math.MaxInt` (int64 max) and pins the
-  // exhausted side; `legacyParseMigrationVersion` mirrors Go's `strconv.Atoi`
-  // (digits only, within int64, BigInt for exact ordering) and is shared with
-  // `migration list` so both surfaces skip the same edge-case versions.
-  // `legacyLoadLocalVersions` yields versions in file-name order, which reverses
-  // `ORDER BY version` whenever one version is a prefix of another
-  // (supabase/cli#6036) — the same desynchronisation
-  // `legacyFindPendingMigrations` sorts away below.
-  const sortedLocal = legacySortMigrationVersions(local);
+  // `legacyOrderMigrationVersions` puts both sides in the integer order this
+  // walk compares them in and drops versions that do not parse; `migration list`
+  // shares it so both surfaces order and skip identically.
+  const sortedRemote = legacyOrderMigrationVersions(remote);
+  const sortedLocal = legacyOrderMigrationVersions(local);
   const extraRemote: Array<string> = [];
   const extraLocal: Array<string> = [];
   let i = 0;
   let j = 0;
-  while (i < remote.length || j < sortedLocal.length) {
-    let remoteTs = LEGACY_MIGRATION_VERSION_MAX;
-    if (i < remote.length) {
-      const parsed = legacyParseMigrationVersion(remote[i]!);
-      if (parsed === undefined) {
-        i++;
-        continue;
-      }
-      remoteTs = parsed;
-    }
-    let localTs = LEGACY_MIGRATION_VERSION_MAX;
-    if (j < sortedLocal.length) {
-      const parsed = legacyParseMigrationVersion(sortedLocal[j]!);
-      if (parsed === undefined) {
-        j++;
-        continue;
-      }
-      localTs = parsed;
-    }
-    if (localTs < remoteTs) {
-      extraLocal.push(sortedLocal[j]!);
+  while (i < sortedRemote.length || j < sortedLocal.length) {
+    const remoteEntry = sortedRemote[i];
+    const localEntry = sortedLocal[j];
+    if (
+      localEntry !== undefined &&
+      (remoteEntry === undefined || localEntry.value < remoteEntry.value)
+    ) {
+      extraLocal.push(localEntry.version);
       j++;
-    } else if (remoteTs < localTs) {
-      extraRemote.push(remote[i]!);
+    } else if (
+      remoteEntry !== undefined &&
+      (localEntry === undefined || remoteEntry.value < localEntry.value)
+    ) {
+      extraRemote.push(remoteEntry.version);
       i++;
     } else {
       i++;
