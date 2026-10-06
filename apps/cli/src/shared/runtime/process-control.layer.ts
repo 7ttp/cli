@@ -1,3 +1,4 @@
+import type { EventEmitter } from "node:events";
 import process from "node:process";
 import { Effect, Layer } from "effect";
 
@@ -91,3 +92,21 @@ export const processControlLayer = Layer.sync(ProcessControl, () =>
     }),
   }),
 );
+
+/**
+ * exitOnBrokenPipe - Exits with 141 (128 + SIGPIPE) on an EPIPE that no other `error` listener
+ * handles, since Bun ignores SIGPIPE and later writes to the closed pipe never settle; other such
+ * errors rethrow.
+ */
+export function exitOnBrokenPipe(
+  streams: ReadonlyArray<EventEmitter>,
+  exit: (code: number) => void,
+): void {
+  for (const stream of streams) {
+    stream.on("error", (error: Error) => {
+      if (stream.listenerCount("error") > 1) return;
+      if (!("code" in error && error.code === "EPIPE")) throw error;
+      exit(141);
+    });
+  }
+}

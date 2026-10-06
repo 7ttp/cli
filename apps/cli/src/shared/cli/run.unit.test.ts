@@ -1,4 +1,4 @@
-import { Cause } from "effect";
+import { Cause, PlatformError } from "effect";
 import { CliError, Command } from "effect/unstable/cli";
 import { describe, expect, it } from "vitest";
 
@@ -103,7 +103,28 @@ describe("shouldUseGlobalSignalInterrupt", () => {
   });
 });
 
+const stdioWriteDefect = (method: "stdout" | "stderr", code: string) =>
+  Cause.die(
+    PlatformError.systemError({
+      module: "Stdio",
+      method,
+      _tag: "Unknown",
+      cause: Object.assign(new Error(`write ${code}`), { code }),
+    }),
+  );
+
 describe("exitCodeForFailure", () => {
+  it.each<"stdout" | "stderr">(["stdout", "stderr"])(
+    "exits 141 when a %s write hit a closed pipe",
+    (method) => {
+      expect(exitCodeForFailure(stdioWriteDefect(method, "EPIPE"))).toBe(141);
+    },
+  );
+
+  it("exits 1 for any other stdio write failure", () => {
+    expect(exitCodeForFailure(stdioWriteDefect("stdout", "ENOSPC"))).toBe(1);
+  });
+
   it("exits 0 for a clean ShowHelp failure (bare group command)", () => {
     const cause = Cause.fail(new CliError.ShowHelp({ commandPath: ["branches"], errors: [] }));
     expect(exitCodeForFailure(cause)).toBe(0);
@@ -142,6 +163,14 @@ describe("exitCodeForFailure", () => {
 });
 
 describe("shouldReportFailure", () => {
+  it("does not report a write to a closed pipe", () => {
+    expect(shouldReportFailure(stdioWriteDefect("stdout", "EPIPE"), 141)).toBe(false);
+  });
+
+  it("reports any other stdio write failure", () => {
+    expect(shouldReportFailure(stdioWriteDefect("stdout", "ENOSPC"), 1)).toBe(true);
+  });
+
   it("does not report a clean exit (0)", () => {
     expect(shouldReportFailure(Cause.fail(new Error("unused")), 0)).toBe(false);
   });

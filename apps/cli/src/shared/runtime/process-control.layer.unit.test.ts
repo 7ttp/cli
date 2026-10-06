@@ -1,8 +1,9 @@
 import process from "node:process";
+import { PassThrough } from "node:stream";
 import { describe, expect, it } from "@effect/vitest";
 import { Deferred, Effect, Exit, Fiber, Scope } from "effect";
 import { ProcessControl } from "./process-control.service.ts";
-import { processControlLayer } from "./process-control.layer.ts";
+import { exitOnBrokenPipe, processControlLayer } from "./process-control.layer.ts";
 
 describe("ProcessControl", () => {
   it.effect("awaitSignal resolves when the requested signal is emitted", () =>
@@ -125,5 +126,53 @@ describe("ProcessControl", () => {
 
       yield* Scope.close(scope, Exit.void);
     }).pipe(Effect.provide(processControlLayer)),
+  );
+});
+
+describe("exitOnBrokenPipe", () => {
+  const writeError = (code: string) => Object.assign(new Error(`write ${code}`), { code });
+
+  const guardedStream = () => {
+    const stream = new PassThrough();
+    const exits: Array<number> = [];
+    exitOnBrokenPipe([stream], (code) => exits.push(code));
+    return { stream, exits };
+  };
+
+  it.effect("exits with 141 when nothing else handles an EPIPE on stdout or stderr", () =>
+    Effect.sync(() => {
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const exits: Array<number> = [];
+      exitOnBrokenPipe([stdout, stderr], (code) => exits.push(code));
+
+      stdout.emit("error", writeError("EPIPE"));
+      stderr.emit("error", writeError("EPIPE"));
+
+      expect(exits).toEqual([141, 141]);
+    }),
+  );
+
+  it.effect.each(["EPIPE", "ENOSPC"])("leaves %s to another error listener", (code) =>
+    Effect.sync(() => {
+      const { stream, exits } = guardedStream();
+      const handled: Array<unknown> = [];
+      stream.on("error", (error) => handled.push(error));
+      const error = writeError(code);
+
+      expect(() => stream.emit("error", error)).not.toThrow();
+      expect(handled).toEqual([error]);
+      expect(exits).toEqual([]);
+    }),
+  );
+
+  it.effect("rethrows any other stream error that nothing else handles", () =>
+    Effect.sync(() => {
+      const { stream, exits } = guardedStream();
+      const error = writeError("ENOSPC");
+
+      expect(() => stream.emit("error", error)).toThrow(error);
+      expect(exits).toEqual([]);
+    }),
   );
 });

@@ -9,6 +9,9 @@ import { defaultCompleteDeps, tryComplete } from "./complete.ts";
 import { resolveStackBackend } from "../command-internal/stack-backend.ts";
 import { resolveComputeEnabled } from "../commands/experimental/compute/compute-backend.ts";
 import { rootCommandForFeatures } from "./root.ts";
+import { exitOnBrokenPipe } from "../shared/runtime/process-control.layer.ts";
+
+exitOnBrokenPipe([process.stdout, process.stderr], (code) => process.exit(code));
 
 const args = await Effect.runPromise(
   Effect.gen(function* () {

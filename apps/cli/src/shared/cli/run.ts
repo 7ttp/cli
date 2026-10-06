@@ -12,6 +12,7 @@ import {
   Layer,
   Path,
   PlatformError,
+  Predicate,
   Runtime,
   Scope,
   Stdio,
@@ -345,19 +346,31 @@ function formatterLayerFor(
  */
 export function exitCodeForFailure(cause: Cause.Cause<unknown>): number {
   if (Cause.hasInterruptsOnly(cause)) return 130;
+  if (isClosedStdioPipe(cause)) return 141;
   return Runtime.getErrorExitCode(Cause.squash(cause));
+}
+
+/** A stdout/stderr write hit EPIPE: the reader is gone, so exit as SIGPIPE would, silently. */
+function isClosedStdioPipe(cause: Cause.Cause<unknown>): boolean {
+  const error = Cause.squash(cause);
+  return (
+    error instanceof PlatformError.PlatformError &&
+    error.reason.module === "Stdio" &&
+    Predicate.hasProperty(error.cause, "code") &&
+    error.cause.code === "EPIPE"
+  );
 }
 
 /**
  * Whether `handledProgram` should render its generic `output.fail` stderr line for a failed run.
- * False for a clean exit (`0`), an interrupt (`130`), and a `GoChildExitError` — a delegated Go
- * child already wrote its own failure to the inherited stderr, so a second line here would be
- * redundant. Checked by concrete type rather than Effect's shared `[Runtime.errorReported]`
- * marker, since `CliError.ShowHelp` also sets that marker `false` for an unrelated reason and
- * would otherwise suppress real error rendering too.
+ * False for a clean exit (`0`), an interrupt (`130`), a closed stdio pipe (nobody would read it),
+ * and a `GoChildExitError` — a delegated Go child already wrote its own failure to the inherited
+ * stderr, so a second line here would be redundant. Checked by concrete type rather than Effect's
+ * shared `[Runtime.errorReported]` marker, since `CliError.ShowHelp` also sets that marker `false`
+ * for an unrelated reason and would otherwise suppress real error rendering too.
  */
 export function shouldReportFailure(cause: Cause.Cause<unknown>, exitCode: number): boolean {
-  if (exitCode === 0 || exitCode === 130) return false;
+  if (exitCode === 0 || exitCode === 130 || isClosedStdioPipe(cause)) return false;
   return !(Cause.squash(cause) instanceof GoChildExitError);
 }
 
