@@ -12,7 +12,6 @@ import {
   Layer,
   Path,
   PlatformError,
-  Predicate,
   Runtime,
   Scope,
   Stdio,
@@ -40,7 +39,7 @@ import { cliConfigProviderLayer } from "../config/cli-config-provider.layer.ts";
 import { cliProjectHomeLayer } from "../config/cli-project-home.layer.ts";
 import { cliProjectContextLayer } from "../config/cli-project-context.layer.ts";
 import { projectLinkStateLayer } from "../config/project-link-state.layer.ts";
-import { processControlLayer } from "../runtime/process-control.layer.ts";
+import { isClosedStdioPipe, processControlLayer } from "../runtime/process-control.layer.ts";
 import { runtimeInfoLayer } from "../runtime/runtime-info.layer.ts";
 import { ttyLayer } from "../runtime/tty.layer.ts";
 import { CommandRuntime } from "../runtime/command-runtime.service.ts";
@@ -348,17 +347,6 @@ export function exitCodeForFailure(cause: Cause.Cause<unknown>): number {
   if (Cause.hasInterruptsOnly(cause)) return 130;
   if (isClosedStdioPipe(cause)) return 141;
   return Runtime.getErrorExitCode(Cause.squash(cause));
-}
-
-/** A stdout/stderr write hit EPIPE: the reader is gone, so exit as SIGPIPE would, silently. */
-function isClosedStdioPipe(cause: Cause.Cause<unknown>): boolean {
-  const error = Cause.squash(cause);
-  return (
-    error instanceof PlatformError.PlatformError &&
-    error.reason.module === "Stdio" &&
-    Predicate.hasProperty(error.cause, "code") &&
-    error.cause.code === "EPIPE"
-  );
 }
 
 /**
@@ -727,6 +715,7 @@ export const runCli = Effect.fnUntraced(function* <
       const output = yield* Output;
       const successTrailer = yield* SuccessTrailer;
       const exit = yield* program.pipe(Effect.exit);
+      if ((yield* processControl.getExitCode) === 141) return 141;
       const afterSuccessHook = options.afterSuccess;
       const afterSuccess = (code: number, cleanShowHelp: boolean) =>
         code === 0
@@ -792,6 +781,7 @@ export const runCli = Effect.fnUntraced(function* <
             ),
           ),
         ),
+        (effect) => Effect.catchCauseIf(effect, isClosedStdioPipe, () => Effect.succeed(141)),
         Effect.catchTag("CliNonZeroExit", (failure) => Effect.succeed(failure.code)),
       );
       return yield* processControl.exit(exitCode);

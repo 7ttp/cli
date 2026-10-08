@@ -1,12 +1,33 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Console, Effect, Exit, Layer } from "effect";
+import {
+  Cause,
+  Console,
+  Effect,
+  Exit,
+  Layer,
+  PlatformError,
+  Schema,
+  Sink,
+  Stdio,
+  Stream,
+} from "effect";
 import { Argument, CliOutput, Command, Flag } from "effect/unstable/cli";
 import { branchesCommand } from "../../commands/branches/branches.command.ts";
 import { GLOBAL_FLAGS, OutputFormatFlag } from "../../command-internal/global-flags.ts";
 import { textCliOutputFormatter } from "../output/text-formatter.ts";
-import { emptyEnv, fakeConsole, mockOutput } from "../../../tests/helpers/mocks.ts";
+import {
+  emptyEnv,
+  fakeConsole,
+  mockOutput,
+  mockProcessControl,
+  mockTty,
+} from "../../../tests/helpers/mocks.ts";
 import { CliArgs } from "./cli-args.service.ts";
 import { exitCodeForFailure, withoutParseErrorHelpDump } from "./run.ts";
+import { Output } from "../output/output.service.ts";
+import { streamJsonOutputLayer } from "../output/output.layer.ts";
+import { withJsonErrorHandling } from "../output/json-error-handling.ts";
+import { settleFeedbackTask } from "../../commands/feedback/feedback-task.ts";
 
 const testBranchesCommand = branchesCommand.pipe(
   Command.withGlobalFlags([OutputFormatFlag, ...GLOBAL_FLAGS]),
@@ -259,5 +280,74 @@ describe("nested command parsing", () => {
       expect(Exit.isSuccess(exit)).toBe(true);
       expect(receivedPaths).toEqual(["-foo.sql", "--literal"]);
     }),
+  );
+});
+
+describe("feedback failure with a closed output pipe", () => {
+  it.effect(
+    "preserves the backend failure and finalizer EPIPE through JSON recovery and cleanup",
+    () => {
+      const backendFailure = new Error("feedback backend failed");
+      const pipeError = PlatformError.systemError({
+        module: "Stdio",
+        method: "stdout",
+        _tag: "Unknown",
+        cause: Object.assign(new Error("write EPIPE"), { code: "EPIPE" }),
+      });
+      let readerOpen = true;
+      let finalized = false;
+      const received: string[] = [];
+      const stdio = Layer.succeed(
+        Stdio.Stdio,
+        Stdio.make({
+          args: Effect.succeed([]),
+          stdin: Stream.empty,
+          stdout: () =>
+            Sink.forEach((chunk: string | Uint8Array) =>
+              Effect.suspend(() =>
+                readerOpen
+                  ? Effect.sync(() => {
+                      received.push(String(chunk));
+                    })
+                  : Effect.fail(pipeError),
+              ),
+            ),
+          stderr: () => Sink.drain,
+        }),
+      );
+      const processControl = mockProcessControl();
+      return Effect.gen(function* () {
+        const output = yield* Output;
+        const task = yield* output.task("Sending feedback");
+        expect(received).toHaveLength(1);
+        const event = yield* Schema.decodeUnknownEffect(
+          Schema.fromJsonString(Schema.Struct({ message: Schema.String })),
+        )(received[0]);
+        expect(event.message).toBe("Sending feedback");
+        readerOpen = false;
+        const exit = yield* withJsonErrorHandling(
+          Effect.fail(backendFailure).pipe(settleFeedbackTask(task)),
+        ).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              finalized = true;
+            }),
+          ),
+          Effect.exit,
+        );
+        expect(finalized).toBe(true);
+        expect(exit).toEqual(
+          Exit.failCause(Cause.combine(Cause.fail(backendFailure), Cause.die(pipeError))),
+        );
+        expect(processControl.exitCode).toBeUndefined();
+      }).pipe(
+        Effect.provide(
+          Layer.merge(
+            streamJsonOutputLayer.pipe(Layer.provide(Layer.merge(stdio, mockTty()))),
+            processControl.layer,
+          ),
+        ),
+      );
+    },
   );
 });

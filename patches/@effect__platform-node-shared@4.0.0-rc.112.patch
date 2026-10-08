@@ -13,3 +13,17 @@ index aa8abbe375f40350f9a5a12f36143d5d85802485..5a86ce881e6a5aa1358059dc0f10ec09
        sink = NodeSink.fromWritable({
          evaluate: () => childProcess.stdin,
          onError: error => toPlatformError("fromWritable(stdin)", toError(error), command),
+diff --git a/dist/NodeSink.js b/dist/NodeSink.js
+--- a/dist/NodeSink.js
++++ b/dist/NodeSink.js
+@@ -48,6 +48,10 @@
+ export const pullIntoWritable = options => options.pull.pipe(Effect.flatMap(chunk => {
+   let i = 0;
+   return Effect.callback(function loop(resume) {
++    if (options.writable.errored != null) {
++      resume(Effect.fail(options.onError(options.writable.errored)));
++      return;
++    }
+     for (; i < chunk.length;) {
+       const success = options.writable.write(chunk[i++], options.encoding);
+       if (!success) {

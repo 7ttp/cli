@@ -1,7 +1,8 @@
 import process from "node:process";
-import { PassThrough } from "node:stream";
+import * as BunSink from "@effect/platform-bun/BunSink";
+import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Exit, Fiber, Scope } from "effect";
+import { Deferred, Effect, Exit, Fiber, Scope, Stream } from "effect";
 import { ProcessControl } from "./process-control.service.ts";
 import { exitOnBrokenPipe, processControlLayer } from "./process-control.layer.ts";
 
@@ -174,5 +175,30 @@ describe("exitOnBrokenPipe", () => {
       expect(() => stream.emit("error", error)).toThrow(error);
       expect(exits).toEqual([]);
     }),
+  );
+});
+
+describe("stdio writable failures", () => {
+  it.effect.each(["EPIPE", "ENOSPC"])(
+    "a subsequent write retains the observed %s instead of waiting for drain",
+    (code) =>
+      Effect.gen(function* () {
+        const error = Object.assign(new Error(`write ${code}`), { code });
+        const writable = new Writable({
+          write(_chunk, _encoding, callback) {
+            callback(error);
+          },
+        });
+        const sink = BunSink.fromWritable({
+          evaluate: () => writable,
+          onError: (failure) => failure,
+          endOnDone: false,
+        });
+        const first = yield* Stream.make("first").pipe(Stream.run(sink), Effect.exit);
+        expect(first).toEqual(Exit.fail(error));
+        expect(writable.errored).toBe(error);
+        const second = yield* Stream.make("second").pipe(Stream.run(sink), Effect.exit);
+        expect(second).toEqual(Exit.fail(error));
+      }),
   );
 });

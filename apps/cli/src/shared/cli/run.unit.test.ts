@@ -121,6 +121,15 @@ describe("exitCodeForFailure", () => {
     },
   );
 
+  it("keeps a finalizer's EPIPE visible alongside the command failure", () => {
+    const cause = Cause.combine(
+      Cause.fail(new Error("backend failed")),
+      stdioWriteDefect("stdout", "EPIPE"),
+    );
+    expect(exitCodeForFailure(cause)).toBe(141);
+    expect(shouldReportFailure(cause, 141)).toBe(false);
+  });
+
   it("exits 1 for any other stdio write failure", () => {
     expect(exitCodeForFailure(stdioWriteDefect("stdout", "ENOSPC"))).toBe(1);
   });

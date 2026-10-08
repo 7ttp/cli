@@ -1,6 +1,6 @@
 import type { EventEmitter } from "node:events";
 import process from "node:process";
-import { Effect, Layer } from "effect";
+import { Cause, Effect, Layer, PlatformError, Predicate } from "effect";
 
 import { ProcessControl, type CliProcessSignal } from "./process-control.service.ts";
 
@@ -81,12 +81,13 @@ export const processControlLayer = Layer.sync(ProcessControl, () =>
             }
           }),
       ).pipe(Effect.asVoid),
-    exit: (code: number) => Effect.sync(() => process.exit(code)),
+    exit: (code: number) => Effect.sync(() => process.exit(hasBrokenProcessPipe() ? 141 : code)),
     setExitCode: (code: number) =>
       Effect.sync(() => {
         process.exitCode = code;
       }),
     getExitCode: Effect.sync(() => {
+      if (hasBrokenProcessPipe()) return 141;
       const exitCode = process.exitCode;
       return typeof exitCode === "number" ? exitCode : undefined;
     }),
@@ -109,4 +110,30 @@ export function exitOnBrokenPipe(
       exit(141);
     });
   }
+}
+
+// Best-effort diagnostics can consume the Effect failure, but the native stream retains it.
+function hasBrokenProcessPipe(): boolean {
+  return [process.stdout, process.stderr].some((stream) => isBrokenPipeError(stream.errored));
+}
+
+function isBrokenPipeError(error: unknown): boolean {
+  return Predicate.hasProperty(error, "code") && error.code === "EPIPE";
+}
+
+/** Whether any failure or defect records a stdout/stderr EPIPE. */
+export function isClosedStdioPipe(cause: Cause.Cause<unknown>): boolean {
+  return cause.reasons.some((reason) => {
+    const error = Cause.isFailReason(reason)
+      ? reason.error
+      : Cause.isDieReason(reason)
+        ? reason.defect
+        : undefined;
+    return (
+      error instanceof PlatformError.PlatformError &&
+      error.reason.module === "Stdio" &&
+      (error.reason.method === "stdout" || error.reason.method === "stderr") &&
+      isBrokenPipeError(error.cause)
+    );
+  });
 }
