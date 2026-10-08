@@ -3,10 +3,10 @@ import type { DatabaseInstance, Stack } from "@supabase/stack/effect";
 import { CommandSettings } from "../config/command-settings.service.ts";
 import { Output } from "../shared/output/output.service.ts";
 import { RuntimeInfo } from "../shared/runtime/runtime-info.service.ts";
-import { skippedRuntimeCleanupWarning, StackApi } from "./stack-api.ts";
+import { StackApi } from "./stack-api.ts";
 import { initializeStackDatabase } from "./stack-bootstrap.ts";
 import { stackProjectRuntime } from "./stack-local-database.ts";
-import { selectStackRuntime } from "./stack-runtime.ts";
+import { selectStackRuntime, type StackRuntime } from "./stack-runtime.ts";
 import { parseConnectionString } from "./db-config.parse.ts";
 import { toPostgresURL } from "./postgres-url.ts";
 import {
@@ -19,15 +19,13 @@ import { listLocalMigrationPaths } from "./migration-history.ts";
 import { applyMigrations } from "./migration-apply.ts";
 import { stackShadowCacheEntry, stackShadowCacheRoles } from "./stack-shadow-cache.ts";
 
-type Runtime = "native" | "docker" | "podman";
-
 export interface StackShadowAcquiredHandle {
   readonly stack: Stack;
   readonly database: DatabaseInstance;
   readonly url: string;
   readonly host: string;
   readonly port: number;
-  readonly runtime: Runtime;
+  readonly runtime: StackRuntime;
   readonly version: string;
   /** Cache lineage when a baseline was restored or atomically published by this handle. */
   readonly snapshotKey?: string;
@@ -36,7 +34,7 @@ export interface StackShadowAcquiredHandle {
 
 interface ShadowOptions {
   readonly port?: number;
-  readonly runtime?: Runtime;
+  readonly runtime?: StackRuntime;
   readonly webhooks?: SetupDatabaseOptions["webhooks"];
   readonly bypassCache?: boolean;
 }
@@ -81,7 +79,7 @@ const acquireNamespace = Effect.fn("StackShadow.acquireNamespace")(function* (op
 
 const initialize = Effect.fn("StackShadow.initialize")(function* (
   stack: Stack,
-  runtime: Runtime,
+  runtime: StackRuntime,
   input: ShadowSetupInput<unknown>,
   opts: ShadowOptions,
 ) {
@@ -203,7 +201,7 @@ const initialize = Effect.fn("StackShadow.initialize")(function* (
   const credentials = yield* database.credentials({ from: "host" });
   const credentialUrl = credentials.databaseUrl;
   const credentialsConn =
-    credentialUrl === undefined ? undefined : parseConnectionString(credentialUrl);
+    credentialUrl === undefined ? undefined : yield* parseConnectionString(credentialUrl);
   if (credentialsConn === undefined || credentialUrl === undefined)
     return yield* new ShadowDbError({
       message: "Shadow database URL is unavailable",
@@ -235,14 +233,6 @@ export const stackAcquireShadowDatabase = Effect.fn("StackShadow.acquire")(funct
   const output = yield* Output;
   const namespace = yield* Effect.acquireRelease(acquireNamespace(opts), ({ stack }) =>
     stack.destroy.pipe(
-      Effect.flatMap((result) =>
-        result.runtimeCleanup === "skipped"
-          ? output.raw(
-              `Warning: ${skippedRuntimeCleanupWarning(`shadow stack ${stack.id}`, result)}\n`,
-              "stderr",
-            )
-          : Effect.void,
-      ),
       Effect.catch((cause) =>
         output.raw(`Failed to destroy shadow stack ${stack.id}: ${cause.message}.\n`, "stderr"),
       ),
@@ -268,7 +258,7 @@ export const stackMigrateShadow = Effect.fn("StackShadow.migrate")(function* (
   const pending = yield* listLocalMigrationPaths(input.fs, input.path, migrationsDir).pipe(
     Effect.mapError((cause) => new ShadowDbError({ message: cause.message, reason: "filesystem" })),
   );
-  const conn = parseConnectionString(handle.url);
+  const conn = yield* parseConnectionString(handle.url);
   if (conn === undefined)
     return yield* new ShadowDbError({ message: "Invalid shadow database URL", reason: "connect" });
   const session = yield* connectShadowDatabase(conn);

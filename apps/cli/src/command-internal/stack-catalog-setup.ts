@@ -15,6 +15,7 @@ import {
   applyDatabaseOverlay,
   type ApplyDatabaseOverlayInput,
   type DbSetupError,
+  ensureStackWebhookSchema,
   type SetupDatabaseOptions,
 } from "./db-bootstrap/db-setup.ts";
 import type { MigrationVaultError, VaultSecret } from "./vault.ts";
@@ -153,7 +154,7 @@ const applyCatalog = Effect.fn("StackCatalogSetup.apply")(function* (
         { concurrency: "unbounded", discard: true },
       );
 
-      const connection = parseConnectionString(hostDatabaseUrl);
+      const connection = yield* parseConnectionString(hostDatabaseUrl);
       if (connection === undefined)
         return yield* new StackCatalogSetupError({
           message: "failed to parse database URL for catalog overlay",
@@ -162,6 +163,10 @@ const applyCatalog = Effect.fn("StackCatalogSetup.apply")(function* (
         isLocal: true,
         dnsResolver: "native",
       });
+      const sqlPath = yield* fs
+        .makeTempDirectoryScoped({ prefix: "supabase-stack-catalog-sql-" })
+        .pipe(Effect.mapError(catalogError));
+      yield* ensureStackWebhookSchema(session, fs, path, sqlPath);
       yield* applyDatabaseOverlay(session, fs, path, input.overlay.workdir, {
         webhooksEnabled: input.overlay.webhooksEnabled,
         apiAutoExposeNewTables: input.overlay.apiAutoExposeNewTables,

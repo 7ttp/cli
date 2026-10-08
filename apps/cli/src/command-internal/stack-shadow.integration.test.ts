@@ -142,7 +142,7 @@ const input = (
 });
 
 const query = Effect.fn("ShadowTest.query")(function* (url: string, sql: string) {
-  const connection = parseConnectionString(url);
+  const connection = yield* parseConnectionString(url);
   if (connection === undefined) return yield* Effect.die("invalid shadow URL");
   const db = yield* DbConnection;
   const session = yield* db.connect(connection, { isLocal: true, dnsResolver: "native" });
@@ -160,7 +160,7 @@ describe("stack shadow databases", () => {
         yield* fs.makeDirectory(path.join(root, "supabase", "migrations"), { recursive: true });
         yield* fs.writeFileString(
           path.join(root, "supabase", "migrations", "20260919000000_shadow.sql"),
-          "CREATE TABLE public.shadow_probe(value text); INSERT INTO public.shadow_probe VALUES ('migrated');",
+          "CREATE TABLE public.shadow_probe(value text); INSERT INTO public.shadow_probe VALUES ('migrated'); CREATE TRIGGER shadow_probe_hook AFTER INSERT ON public.shadow_probe FOR EACH ROW EXECUTE FUNCTION supabase_functions.http_request('http://127.0.0.1:9', 'POST', '{}', '{}', '1000');",
         );
         const output = mockOutput();
         const roots: string[] = [];
@@ -248,7 +248,7 @@ describe("stack shadow databases", () => {
                 const credentials = yield* handle.database.credentials({ from: "host" });
                 if (credentials.databaseUrl === undefined)
                   return yield* Effect.die("missing database credentials");
-                const connection = parseConnectionString(credentials.databaseUrl);
+                const connection = yield* parseConnectionString(credentials.databaseUrl);
                 if (connection === undefined) return yield* Effect.die("invalid database URL");
                 expect(sql.port).toBe(handle.port);
                 expect(connection.port).toBe(sql.port);
@@ -394,7 +394,7 @@ describe("stack shadow databases", () => {
               const credentials = yield* recovered.database.credentials({ from: "host" });
               if (credentials.databaseUrl === undefined)
                 return yield* Effect.die("missing database credentials");
-              const connection = parseConnectionString(credentials.databaseUrl);
+              const connection = yield* parseConnectionString(credentials.databaseUrl);
               if (connection === undefined) return yield* Effect.die("invalid database URL");
               expect(sql.port).toBe(recovered.port);
               expect(connection.port).toBe(sql.port);
@@ -458,15 +458,14 @@ describe("stack shadow databases", () => {
   );
 
   it.live(
-    "prints the cleanup commands when a shadow's destroy skips its engine",
+    "reports a shadow whose destroy fails because its engine is unreachable",
     () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
-        const root = yield* fs.makeTempDirectoryScoped({ prefix: "stack-shadow-skipped-" });
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "stack-shadow-unreachable-" });
         const output = mockOutput();
-        const cleanupCommand = "docker rm --force $(docker ps --all --quiet)";
-        // A real registration whose database creation fails fast and whose destroy reports skipped cleanup.
+        // A real registration whose database creation fails fast and whose destroy fails with the engine unreachable.
         const api = Layer.effect(
           StackApi,
           Effect.gen(function* () {
@@ -482,11 +481,13 @@ describe("stack shadow databases", () => {
                       create: () =>
                         Effect.fail(new StackError({ operation: "create", message: "injected" })),
                     },
-                    destroy: Effect.succeed({
-                      runtimeCleanup: "skipped",
-                      engine: "docker",
-                      cleanupCommands: [cleanupCommand],
-                    } as const),
+                    destroy: Effect.fail(
+                      new StackError({
+                        operation: "destroy",
+                        message: "Docker CLI or daemon isn't reachable",
+                        reason: "runtime-unavailable",
+                      }),
+                    ),
                   })),
                 ),
             });
@@ -510,7 +511,7 @@ describe("stack shadow databases", () => {
         );
 
         expect(output.stderrText).toMatch(
-          /Warning: Docker was unavailable, so Docker resources for shadow stack [0-9a-f]{64} were not removed\. Once it is running, remove them with:\n {2}docker rm --force \$\(docker ps --all --quiet\)\n/u,
+          /Failed to destroy shadow stack [0-9a-f]{64}: Docker CLI or daemon isn't reachable\.\n/u,
         );
       }).pipe(Effect.scoped, Effect.provide(BunServices.layer)),
     120_000,

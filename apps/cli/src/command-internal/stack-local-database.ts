@@ -24,6 +24,7 @@ import {
   automaticRuntimeNotice,
   recordStackRuntimeTelemetry,
   selectStackRuntime,
+  type StackRuntime,
 } from "./stack-runtime.ts";
 import { Output } from "../shared/output/output.service.ts";
 import type { PgConnInput } from "./db-connection.service.ts";
@@ -36,8 +37,15 @@ const cacheRoot = (settings: Settings, path: Path.Path) =>
   path.join(settings.supabaseHome, "cache", "stack");
 const notRunning = (message = "The local stack is not running.") =>
   new LocalDbRunningError({ message });
+const unavailable = (cause: { readonly message: string }) =>
+  cause instanceof LocalDbRunningError
+    ? cause
+    : new LocalDbRunningError({ message: cause.message, cause });
 const startFailed = (cause: { readonly message: string }) =>
-  new LocalDbRunningError({ message: `failed to start local database: ${cause.message}` });
+  new LocalDbRunningError({
+    message: `failed to start local database: ${cause.message}`,
+    cause,
+  });
 
 type StackInstances = Effect.Success<Stack["services"]["list"]>;
 
@@ -98,7 +106,7 @@ export const stackOpenProjectBy = <E>(onFailure: (cause: { readonly message: str
   openProjectStack().pipe(Effect.mapError(onFailure));
 
 /** Returns the project stack only when its primary database is healthy. */
-export const stackOpenReadyProject = stackOpenProjectBy((cause) => notRunning(cause.message)).pipe(
+export const stackOpenReadyProject = stackOpenProjectBy(unavailable).pipe(
   Effect.flatMap((opened) =>
     Option.isNone(opened) ? Effect.succeed(Option.none()) : databaseReady(opened.value),
   ),
@@ -127,7 +135,7 @@ const RUNTIME_UNAVAILABLE = new StackRuntimeUnavailableError({
 });
 
 export const stackRequireProjectRuntime: Effect.Effect<
-  "native" | "docker" | "podman",
+  StackRuntime,
   StackRuntimeUnavailableError,
   CommandSettings | StackApi | Path.Path
 > = stackProjectRuntime.pipe(
@@ -179,13 +187,9 @@ const stackLocalDatabaseUrl: Effect.Effect<
   LocalDbRunningError,
   CommandSettings | StackApi | Path.Path
 > = Effect.gen(function* () {
-  const opened = yield* stackOpenReadyProject.pipe(
-    Effect.mapError((cause) => notRunning(cause.message)),
-  );
+  const opened = yield* stackOpenReadyProject.pipe(Effect.mapError(unavailable));
   if (Option.isNone(opened)) return yield* notRunning();
-  const status = yield* opened.value.database.status.pipe(
-    Effect.mapError((cause) => notRunning(cause.message)),
-  );
+  const status = yield* opened.value.database.status.pipe(Effect.mapError(unavailable));
   const endpoint = status.endpoints.find(({ name }) => name === "sql");
   if (status.config.service !== "database")
     return yield* notRunning("The local stack primary service is not a database.");
@@ -201,15 +205,15 @@ const stackLocalDatabaseUrl: Effect.Effect<
 export const stackLocalDatabaseConn: Effect.Effect<
   PgConnInput,
   LocalDbRunningError,
-  CommandSettings | StackApi | Path.Path
+  CommandSettings | StackApi | FileSystem.FileSystem | Path.Path
 > = stackLocalDatabaseUrl.pipe(
-  Effect.flatMap((url) => {
-    const conn = parseConnectionString(url);
-    return conn === undefined
+  Effect.flatMap((url) => parseConnectionString(url)),
+  Effect.flatMap((conn) =>
+    conn === undefined
       ? Effect.fail(notRunning("failed to parse stack database URL"))
-      : Effect.succeed(conn);
-  }),
-  Effect.mapError((cause) => notRunning(cause.message)),
+      : Effect.succeed(conn),
+  ),
+  Effect.mapError(unavailable),
 );
 
 /** Starts or resumes the primary database, initializing the catalog on first creation. */

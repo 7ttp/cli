@@ -27,11 +27,16 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import packageJson from "../package.json" with { type: "json" };
+import { isStackFailureKind, type StackFailureKind } from "./FailureKind.ts";
 import { HOST_PROCESS_DISPATCH_SENTINEL, isBunVirtualPath } from "./internal/dispatch-markers.ts";
 import { failureMessage } from "./internal/failure-message.ts";
 import { stackSourceDigest } from "./internal/release.ts";
 import { StackRpc } from "./Rpc.ts";
-import { SavedStack, type Interface as StateInterface, type StateError } from "./State.ts";
+import {
+  SavedStack,
+  type Interface as StateInterface,
+  type NamespaceError,
+} from "./StackNamespace.ts";
 
 declare const SUPABASE_STACK_BUILD_ID: string | undefined;
 
@@ -82,6 +87,7 @@ export class HostProcessError extends Data.TaggedError("HostProcessError")<{
   readonly message: string;
   readonly cause?: unknown;
   readonly reason?: HostFailureReason;
+  readonly kind?: StackFailureKind;
 }> {}
 type HostFailureReason =
   | "unregistered"
@@ -126,18 +132,28 @@ export const ShutdownFailure = Schema.Struct({
         id: Schema.String,
         succeeded: Schema.Boolean,
         error: Schema.optionalKey(Schema.String),
+        /** A `StackFailureKind`, kept an open string so an older release ignores newer kinds. */
+        kind: Schema.optionalKey(Schema.String),
       }),
     ),
   ),
+  /** A `StackFailureKind`, kept an open string so an older release ignores newer kinds. */
+  kind: Schema.optionalKey(Schema.String),
 });
 export interface ShutdownFailure extends Schema.Schema.Type<typeof ShutdownFailure> {}
 
-const error = (operation: string, cause: unknown, reason?: HostFailureReason) =>
+const error = (
+  operation: string,
+  cause: unknown,
+  reason?: HostFailureReason,
+  kind?: StackFailureKind,
+) =>
   new HostProcessError({
     operation,
     message: failureMessage(cause),
     cause,
     ...(reason === undefined ? {} : { reason }),
+    ...(kind === undefined ? {} : { kind }),
   });
 /** Matches owner failures by reason. */
 export const hasReason =
@@ -259,7 +275,7 @@ export const connectHost = Effect.fn("HostProcess.connectHost")(function* (
   options: ConnectOptions = {},
 ): Effect.fn.Return<
   HostAccess,
-  HostProcessError | StateError,
+  HostProcessError | NamespaceError,
   HttpClient.HttpClient | FileSystem.FileSystem | Path.Path | Crypto.Crypto
 > {
   const stack = yield* registered(state, stackId);
@@ -294,6 +310,8 @@ export const connectHost = Effect.fn("HostProcess.connectHost")(function* (
         ? error(
             "connect",
             `Stack owner did not become reachable: ${failure.message} (owner log: ${state.ownerLog(stackId)})`,
+            undefined,
+            "owner-startup",
           )
         : failure,
     ),
@@ -342,6 +360,8 @@ export interface LaunchOptions {
   readonly cacheRoot: string;
   readonly stackId: string;
   readonly entrypoint?: string;
+  /** Extra positional arguments a non-default `entrypoint` reads, ahead of `register`. */
+  readonly entrypointArgs?: ReadonlyArray<string>;
   /** Registers this definition once the spawned owner holds the lease. */
   readonly register?: SavedStack;
   /** Ties a spawned owner to the enclosing scope, whose closure destroys the stack. */
@@ -353,6 +373,7 @@ const readyLine = Schema.Union([
     type: Schema.Literal("error"),
     message: Schema.String,
     reason: Schema.optionalKey(Schema.Literals(["lease-held", "exists", "runtime-unavailable"])),
+    kind: Schema.optionalKey(Schema.String),
   }),
 ]);
 
@@ -445,12 +466,13 @@ const spawnOwner = Effect.fn("HostProcess.spawnOwner")(function* (
     }),
     (descriptor) =>
       Effect.gen(function* () {
-        const failure = (cause: unknown, reason?: HostFailureReason) => {
+        const failure = (cause: unknown, reason?: HostFailureReason, kind?: StackFailureKind) => {
           const tail = logTail(descriptor);
           return error(
             "startup",
             `Stack owner failed to start: ${error("startup", cause).message} (owner log: ${log})${tail.length === 0 ? "" : `\n${tail}`}`,
             reason,
+            kind,
           );
         };
         const spawnFailed = yield* Deferred.make<never, HostProcessError>();
@@ -459,7 +481,14 @@ const spawnOwner = Effect.fn("HostProcess.spawnOwner")(function* (
             try: () => {
               const started = spawn(
                 process.execPath,
-                [entrypoint, options.stateRoot, options.cacheRoot, options.stackId, ...register],
+                [
+                  entrypoint,
+                  options.stateRoot,
+                  options.cacheRoot,
+                  options.stackId,
+                  ...(options.entrypointArgs ?? []),
+                  ...register,
+                ],
                 {
                   cwd: process.cwd(),
                   detached: true,
@@ -526,8 +555,18 @@ const spawnOwner = Effect.fn("HostProcess.spawnOwner")(function* (
                     );
                 }
                 return yield* line.reason === "lease-held" || line.reason === "exists"
-                  ? error("startup", "Stack already exists; use open")
-                  : failure(line.message, line.reason);
+                  ? error(
+                      "startup",
+                      "Stack already exists; use open",
+                      undefined,
+                      line.reason === "exists" ? "already-exists" : "lease-held",
+                    )
+                  : error(
+                      "startup",
+                      `Stack owner failed to start: ${line.message} (owner log: ${log})`,
+                      line.reason,
+                      isStackFailureKind(line.kind) ? line.kind : undefined,
+                    );
               }
               if (line.endpoint.stackId !== options.stackId)
                 return yield* failure(
@@ -564,7 +603,7 @@ export const launchHost = Effect.fn("HostProcess.launchHost")(function* (
   options: LaunchOptions,
 ): Effect.fn.Return<
   HostAccess,
-  HostProcessError | StateError,
+  HostProcessError | NamespaceError,
   Scope.Scope | HttpClient.HttpClient | FileSystem.FileSystem | Path.Path | Crypto.Crypto
 > {
   const entrypoint = options.entrypoint ?? hostEntrypointFor(import.meta.url);

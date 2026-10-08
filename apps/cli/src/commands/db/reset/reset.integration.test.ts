@@ -39,6 +39,7 @@ import {
   sequentialExecBatch,
   transportFailure,
 } from "../../../../tests/helpers/command-mocks.ts";
+import { unusedGateway } from "../../../../tests/helpers/unused-stack.ts";
 import { CommandPlatformApi } from "../../../auth/command-platform-api.service.ts";
 import { CommandPlatformApiFactory } from "../../../auth/command-platform-api-factory.service.ts";
 import { ProjectRefNotLinkedError } from "../../../config/project-ref.errors.ts";
@@ -614,13 +615,9 @@ function makeStackObservation(
     lifecycle: opts.lifecycle ?? "stopped",
     health: opts.health,
     error: opts.error,
-    cleanupError: undefined,
     exit: undefined,
     currentOperation: undefined,
-    launchId: undefined,
-    intentRevision: 0,
     wakeEnabled: opts.wakeEnabled ?? false,
-    registered: true,
   };
 }
 
@@ -808,6 +805,7 @@ function mockResetStackApi(opts: {
     },
     stop: Effect.die("unused"),
     destroy: Effect.die("unused"),
+    gateway: unusedGateway,
     commands: { run: () => Effect.die("unused") },
   };
   return {
@@ -827,7 +825,6 @@ function mockResetStackApi(opts: {
               })),
               lifetime: "detached" as const,
               composition: { members: [], dependencies: [] },
-              ports: [],
             },
             host: undefined,
           }),
@@ -2442,7 +2439,7 @@ describe("db reset", () => {
           yield* dbReset({ ...DEFAULT_FLAGS, linked: true }).pipe(Effect.provide(layer));
           expect(out.stderrText).toContain("Applying migration 20240101000000_test.sql...");
         }),
-      );
+      ).pipe((body) => withConfigEnv({ MIGRATIONS_ENABLED: "true" }, body));
     });
 
     it.live("rejects mutually exclusive target flags", () => {
