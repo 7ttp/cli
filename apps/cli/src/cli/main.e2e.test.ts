@@ -91,6 +91,7 @@ describe("CLI output to a closed pipe", () => {
         env: {
           ...isolatedEnv,
           ...options.env,
+          SUPABASE_PROJECT_ID: "abcdefghijklmnopqrst",
           SUPABASE_ACCESS_TOKEN: `sbp_${"a".repeat(40)}`,
           SUPABASE_PROFILE: profilePath,
         },
