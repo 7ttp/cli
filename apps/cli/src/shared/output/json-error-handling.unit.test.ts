@@ -1,7 +1,8 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Data, Effect, Exit, Layer, Option } from "effect";
+import { Cause, Data, Effect, Exit, Layer, Option } from "effect";
 import { mockProcessControl } from "../../../tests/helpers/mocks.ts";
 import { GoChildExitError } from "../../command-internal/go-child-exit.error.ts";
+import { ProcessControl } from "../runtime/process-control.service.ts";
 import { Output } from "./output.service.ts";
 import { withJsonErrorHandling } from "./json-error-handling.ts";
 
@@ -104,6 +105,26 @@ describe("withJsonErrorHandling", () => {
       }).pipe(Effect.provide(processControl.layer));
     });
   });
+
+  it.effect.each(["json", "stream-json"] as const)(
+    "preserves the full failure without rendering in %s after native EPIPE set exit 141",
+    (format) => {
+      const out = mockOutput(format);
+      const processControl = mockProcessControl();
+      const cause = Cause.combine(
+        Cause.fail(new TaggedErrorMinimal({ message: "backend failed" })),
+        Cause.die(new Error("cleanup failed")),
+      );
+      return Effect.gen(function* () {
+        const pc = yield* ProcessControl;
+        yield* pc.setExitCode(141);
+        const exit = yield* withJsonErrorHandling(Effect.failCause(cause)).pipe(Effect.exit);
+        expect(exit).toEqual(Exit.failCause(cause));
+        expect(out.failCalls).toEqual([]);
+        expect(processControl.exitCode).toBe(141);
+      }).pipe(Effect.provide(Layer.merge(out.layer, processControl.layer)));
+    },
+  );
 
   describe("json format", () => {
     it.effect("calls output.fail() with structured error and sets process.exitCode", () => {

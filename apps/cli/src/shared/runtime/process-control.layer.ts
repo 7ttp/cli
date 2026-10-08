@@ -1,6 +1,17 @@
 import type { EventEmitter } from "node:events";
 import process from "node:process";
-import { Cause, Effect, Layer, PlatformError, Predicate } from "effect";
+import {
+  Cause,
+  Context,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  PlatformError,
+  Predicate,
+} from "effect";
 
 import { ProcessControl, type CliProcessSignal } from "./process-control.service.ts";
 
@@ -94,23 +105,96 @@ export const processControlLayer = Layer.sync(ProcessControl, () =>
   }),
 );
 
-/**
- * exitOnBrokenPipe - Exits with 141 (128 + SIGPIPE) on an EPIPE that no other `error` listener
- * handles, since Bun ignores SIGPIPE and later writes to the closed pipe never settle; other such
- * errors rethrow.
- */
+/** Installs the early-entrypoint fallback; remove it before Effect owns command cleanup. */
 export function exitOnBrokenPipe(
   streams: ReadonlyArray<EventEmitter>,
   exit: (code: number) => void,
-): void {
-  for (const stream of streams) {
-    stream.on("error", (error: Error) => {
+): () => void {
+  const listeners = streams.map((stream) => {
+    const listener = (error: Error) => {
       if (stream.listenerCount("error") > 1) return;
       if (!("code" in error && error.code === "EPIPE")) throw error;
       exit(141);
-    });
-  }
+    };
+    stream.on("error", listener);
+    return () => stream.off("error", listener);
+  });
+  return () => {
+    for (const remove of listeners) remove();
+  };
 }
+
+class ClosedStdioPipe extends Context.Service<
+  ClosedStdioPipe,
+  {
+    readonly observed: Effect.Effect<boolean>;
+  }
+>()("supabase/runtime/ClosedStdioPipe") {}
+
+/** Whether this execution has observed a native stdout/stderr EPIPE. */
+export const hasClosedStdioPipe = Effect.gen(function* () {
+  const pipe = yield* Effect.serviceOption(ClosedStdioPipe);
+  return Option.isSome(pipe) ? yield* pipe.value.observed : hasBrokenProcessPipe();
+});
+
+/** Owns stdio error listeners until the command and its scoped cleanup finish. */
+export const withStdioPipeHandling = <A, E, R>(
+  self: Effect.Effect<A, E, R>,
+  streams: Readonly<Record<"stdout" | "stderr", EventEmitter>> = process,
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const pipe = yield* Deferred.make<PlatformError.PlatformError>();
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const methods: ReadonlyArray<"stdout" | "stderr"> = ["stdout", "stderr"];
+          return methods.map((method) => {
+            const stream = streams[method];
+            const listener = (error: unknown) => {
+              if (isBrokenPipeError(error)) {
+                Deferred.doneUnsafe(
+                  pipe,
+                  Effect.succeed(
+                    PlatformError.systemError({
+                      module: "Stdio",
+                      method,
+                      _tag: "Unknown",
+                      cause: error,
+                    }),
+                  ),
+                );
+              } else if (stream.listenerCount("error") === 1) {
+                throw error;
+              }
+            };
+            stream.on("error", listener);
+            return () => stream.off("error", listener);
+          });
+        }),
+        (listeners) =>
+          Effect.sync(() => {
+            for (const remove of listeners) remove();
+          }),
+      );
+      const task = yield* self.pipe(
+        Effect.provideService(ClosedStdioPipe, { observed: Deferred.isDone(pipe) }),
+        Effect.forkScoped,
+      );
+      const outcome = yield* Effect.raceFirst(
+        Fiber.await(task).pipe(Effect.map(Option.some)),
+        Deferred.await(pipe).pipe(Effect.as(Option.none())),
+      );
+      if (Option.isNone(outcome)) yield* Fiber.interrupt(task);
+      const exit = Option.isSome(outcome) ? outcome.value : yield* Fiber.await(task);
+      if (yield* Deferred.isDone(pipe)) {
+        const error = yield* Deferred.await(pipe);
+        return yield* Effect.failCause(
+          Exit.isFailure(exit) ? Cause.combine(exit.cause, Cause.fail(error)) : Cause.fail(error),
+        );
+      }
+      return yield* exit;
+    }),
+  ).pipe(Effect.withSpan("ProcessControl.stdio"));
 
 // Best-effort diagnostics can consume the Effect failure, but the native stream retains it.
 function hasBrokenProcessPipe(): boolean {

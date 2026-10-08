@@ -11,7 +11,9 @@ import { resolveComputeEnabled } from "../commands/experimental/compute/compute-
 import { cliEntrypointForFeatures } from "./root.ts";
 import { exitOnBrokenPipe } from "../shared/runtime/process-control.layer.ts";
 
-exitOnBrokenPipe([process.stdout, process.stderr], (code) => process.exit(code));
+const removeEarlyPipeGuard = exitOnBrokenPipe([process.stdout, process.stderr], (code) =>
+  process.exit(code),
+);
 
 const args = await Effect.runPromise(
   Effect.gen(function* () {
@@ -44,6 +46,7 @@ if (
     defaultCompleteDeps(Exit.isSuccess(selectionExit) ? selectedRoot : undefined, selectionCause),
   ))
 ) {
+  removeEarlyPipeGuard();
   await Effect.runPromise(
     runCli(selectedRoot, {
       analyticsLayer: analyticsLayer.pipe(Layer.provide(FetchHttpClient.layer)),

@@ -2,9 +2,15 @@ import process from "node:process";
 import * as BunSink from "@effect/platform-bun/BunSink";
 import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Exit, Fiber, Scope, Stream } from "effect";
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, PlatformError, Scope, Stream } from "effect";
 import { ProcessControl } from "./process-control.service.ts";
-import { exitOnBrokenPipe, processControlLayer } from "./process-control.layer.ts";
+import {
+  exitOnBrokenPipe,
+  processControlLayer,
+  withStdioPipeHandling,
+  isClosedStdioPipe,
+  hasClosedStdioPipe,
+} from "./process-control.layer.ts";
 
 describe("ProcessControl", () => {
   it.effect("awaitSignal resolves when the requested signal is emitted", () =>
@@ -136,8 +142,8 @@ describe("exitOnBrokenPipe", () => {
   const guardedStream = () => {
     const stream = new PassThrough();
     const exits: Array<number> = [];
-    exitOnBrokenPipe([stream], (code) => exits.push(code));
-    return { stream, exits };
+    const removeGuard = exitOnBrokenPipe([stream], (code) => exits.push(code));
+    return { stream, exits, removeGuard };
   };
 
   it.effect("exits with 141 when nothing else handles an EPIPE on stdout or stderr", () =>
@@ -156,7 +162,7 @@ describe("exitOnBrokenPipe", () => {
 
   it.effect.each(["EPIPE", "ENOSPC"])("leaves %s to another error listener", (code) =>
     Effect.sync(() => {
-      const { stream, exits } = guardedStream();
+      const { stream, exits, removeGuard } = guardedStream();
       const handled: Array<unknown> = [];
       stream.on("error", (error) => handled.push(error));
       const error = writeError(code);
@@ -164,6 +170,10 @@ describe("exitOnBrokenPipe", () => {
       expect(() => stream.emit("error", error)).not.toThrow();
       expect(handled).toEqual([error]);
       expect(exits).toEqual([]);
+      removeGuard();
+      expect(stream.listenerCount("error")).toBe(1);
+      stream.emit("error", error);
+      expect(handled).toEqual([error, error]);
     }),
   );
 
@@ -200,5 +210,154 @@ describe("stdio writable failures", () => {
         const second = yield* Stream.make("second").pipe(Stream.run(sink), Effect.exit);
         expect(second).toEqual(Exit.fail(error));
       }),
+  );
+});
+
+describe("scoped stdio pipe handling", () => {
+  it.effect.each(["stdout", "stderr"] as const)(
+    "cancels on a deferred %s write error and retains listeners through cleanup",
+    (method) =>
+      Effect.gen(function* () {
+        const error = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+        const cleanupStarted = yield* Deferred.make<void>();
+        const releaseCleanup = yield* Deferred.make<void>();
+        const events: string[] = [];
+        const stream = new Writable({
+          write(_chunk, _encoding, callback) {
+            queueMicrotask(() => callback(error));
+          },
+        });
+        const other = new PassThrough();
+        const streams =
+          method === "stdout"
+            ? { stdout: stream, stderr: other }
+            : { stdout: other, stderr: stream };
+        const sink = BunSink.fromWritable({
+          evaluate: () => stream,
+          onError: (cause) =>
+            PlatformError.systemError({ module: "Stdio", method, _tag: "Unknown", cause }),
+          endOnDone: false,
+        });
+        const task = Effect.scoped(
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(() =>
+              Effect.gen(function* () {
+                expect(yield* hasClosedStdioPipe).toBe(true);
+                events.push("rollback");
+                yield* Deferred.succeed(cleanupStarted, undefined);
+                yield* Deferred.await(releaseCleanup);
+                events.push("released");
+              }),
+            );
+            yield* Stream.make("payload").pipe(Stream.run(sink));
+            events.push("write returned");
+            return yield* Effect.never;
+          }),
+        ).pipe(
+          Effect.provide(
+            Layer.effectDiscard(
+              Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  events.push("layer released");
+                }),
+              ),
+            ),
+          ),
+        );
+        const fiber = yield* withStdioPipeHandling(task, streams).pipe(Effect.forkScoped);
+        yield* Deferred.await(cleanupStarted);
+        expect(events).toEqual(["write returned", "rollback"]);
+        expect(stream.listenerCount("error")).toBe(1);
+        stream.emit("error", error);
+        other.emit("error", error);
+        yield* Deferred.succeed(releaseCleanup, undefined);
+        const exit = yield* Fiber.await(fiber);
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) expect(isClosedStdioPipe(exit.cause)).toBe(true);
+        expect(events).toEqual(["write returned", "rollback", "released", "layer released"]);
+        expect(stream.listenerCount("error")).toBe(0);
+        expect(other.listenerCount("error")).toBe(0);
+      }),
+  );
+
+  it.effect("preserves cleanup defects alongside the typed EPIPE", () =>
+    Effect.gen(function* () {
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const defect = new Error("rollback failed");
+      const exit = yield* withStdioPipeHandling(
+        Effect.sync(() =>
+          stdout.emit("error", Object.assign(new Error("pipe"), { code: "EPIPE" })),
+        ).pipe(Effect.andThen(Effect.never), Effect.ensuring(Effect.die(defect))),
+        { stdout, stderr },
+      ).pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) {
+        expect(isClosedStdioPipe(exit.cause)).toBe(true);
+        expect(
+          exit.cause.reasons.some(
+            (reason) => Cause.isDieReason(reason) && reason.defect === defect,
+          ),
+        ).toBe(true);
+      }
+    }),
+  );
+
+  it.effect("releases the task and listeners when its parent is interrupted", () =>
+    Effect.gen(function* () {
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const ready = yield* Deferred.make<void>();
+      let released = false;
+      const task = Deferred.succeed(ready, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.ensuring(
+          Effect.sync(() => {
+            released = true;
+          }),
+        ),
+      );
+      const fiber = yield* withStdioPipeHandling(task, { stdout, stderr }).pipe(Effect.forkScoped);
+      yield* Deferred.await(ready);
+      yield* Fiber.interrupt(fiber);
+      expect(released).toBe(true);
+      const exit = yield* Fiber.await(fiber);
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
+      expect(stdout.listenerCount("error")).toBe(0);
+      expect(stderr.listenerCount("error")).toBe(0);
+    }),
+  );
+
+  it.effect("removes only owned listeners and isolates consecutive executions", () =>
+    Effect.gen(function* () {
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const errors: unknown[] = [];
+      const listener = (error: unknown) => errors.push(error);
+      stdout.on("error", listener);
+      const error = Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      yield* withStdioPipeHandling(
+        Effect.sync(() => stdout.emit("error", error)),
+        { stdout, stderr },
+      );
+      expect(errors).toEqual([error]);
+      expect(stdout.listeners("error")).toEqual([listener]);
+      expect(stderr.listenerCount("error")).toBe(0);
+      const pipeExit = yield* withStdioPipeHandling(
+        Effect.sync(() =>
+          stderr.emit("error", Object.assign(new Error("pipe"), { code: "EPIPE" })),
+        ),
+        { stdout, stderr },
+      ).pipe(Effect.exit);
+      expect(Exit.isFailure(pipeExit) && isClosedStdioPipe(pipeExit.cause)).toBe(true);
+      expect(yield* withStdioPipeHandling(hasClosedStdioPipe, { stdout, stderr })).toBe(false);
+      stdout.off("error", listener);
+      const exit = yield* withStdioPipeHandling(
+        Effect.sync(() => stdout.emit("error", error)),
+        { stdout, stderr },
+      ).pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe(error);
+    }),
   );
 });

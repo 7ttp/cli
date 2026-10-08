@@ -1,9 +1,14 @@
+import process from "node:process";
+import { BunFileSystem } from "@effect/platform-bun";
+import { vi } from "vitest";
+import { useTempWorkdir, withEnvVar } from "../../../tests/helpers/command-mocks.ts";
 import { describe, expect, it } from "@effect/vitest";
 import {
   Cause,
   Console,
   Effect,
   Exit,
+  FileSystem,
   Layer,
   PlatformError,
   Schema,
@@ -19,11 +24,12 @@ import {
   emptyEnv,
   fakeConsole,
   mockOutput,
+  mockAnalytics,
   mockProcessControl,
   mockTty,
 } from "../../../tests/helpers/mocks.ts";
 import { CliArgs } from "./cli-args.service.ts";
-import { exitCodeForFailure, withoutParseErrorHelpDump } from "./run.ts";
+import { runCli, exitCodeForFailure, withoutParseErrorHelpDump } from "./run.ts";
 import { Output } from "../output/output.service.ts";
 import { streamJsonOutputLayer } from "../output/output.layer.ts";
 import { withJsonErrorHandling } from "../output/json-error-handling.ts";
@@ -347,6 +353,123 @@ describe("feedback failure with a closed output pipe", () => {
             processControl.layer,
           ),
         ),
+      );
+    },
+  );
+});
+
+describe("runCli closed-pipe cleanup", () => {
+  const workdir = useTempWorkdir("supabase-pipe-cleanup-");
+
+  it.live.each(["status", "serve"])(
+    "finishes command, telemetry and trace cleanup before exiting 141 for %s",
+    (command) => {
+      const events: string[] = [];
+      const initialArgv = process.argv;
+      const initialCode = process.exitCode;
+      const initialListeners = [
+        process.stdout.listenerCount("error"),
+        process.stderr.listenerCount("error"),
+      ];
+      const traceFile = `${workdir.current}/trace.jsonl`;
+      const exitSentinel = new Error("process exited");
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation((code) => {
+        events.push(`exit:${code}`);
+        throw exitSentinel;
+      });
+      const handler = Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              events.push("rollback");
+              process.stderr.emit(
+                "error",
+                Object.assign(new Error("cleanup pipe"), { code: "EPIPE" }),
+              );
+            }),
+          );
+          process.stdout.emit("error", Object.assign(new Error("pipe"), { code: "EPIPE" }));
+          return yield* Effect.never;
+        }),
+      );
+      const root = Command.make("supabase").pipe(
+        Command.withSubcommands([
+          command === "status"
+            ? Command.make("status", {}, () => handler)
+            : Command.make("functions").pipe(
+                Command.withSubcommands([Command.make("serve", {}, () => handler)]),
+              ),
+        ]),
+      );
+      process.argv = [
+        ...initialArgv.slice(0, 2),
+        ...(command === "status" ? ["status"] : ["functions", "serve"]),
+      ];
+      const analyticsLayer = mockAnalytics().layer.pipe(
+        Layer.provideMerge(
+          Layer.effectDiscard(
+            Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                events.push("telemetry released");
+              }),
+            ),
+          ),
+        ),
+      );
+      return runCli(root, { analyticsLayer, agentDefaultOutputFormat: "text" }).pipe(
+        Effect.exit,
+        Effect.tap((exit) =>
+          Effect.gen(function* () {
+            const fs = yield* FileSystem.FileSystem;
+            const trace = yield* fs.readFileString(traceFile);
+            const batches = trace
+              .trim()
+              .split("\n")
+              .map(
+                (
+                  line,
+                ): {
+                  resourceSpans: Array<{
+                    scopeSpans: Array<{
+                      spans: Array<{
+                        name: string;
+                        attributes: Array<{ key: string; value: { intValue?: string | number } }>;
+                      }>;
+                    }>;
+                  }>;
+                } => JSON.parse(line),
+              );
+            const spans = batches.flatMap((batch) =>
+              batch.resourceSpans.flatMap((resource) =>
+                resource.scopeSpans.flatMap((scope) => scope.spans),
+              ),
+            );
+            const code = spans
+              .find((span) => span.name === "cli.run")
+              ?.attributes.find((attribute) => attribute.key === "process.exit_code");
+            expect(Number(code?.value.intValue)).toBe(141);
+            expect(Exit.isFailure(exit)).toBe(true);
+            if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBe(exitSentinel);
+            expect(events).toEqual(["rollback", "telemetry released", "exit:141"]);
+            expect([
+              process.stdout.listenerCount("error"),
+              process.stderr.listenerCount("error"),
+            ]).toEqual(initialListeners);
+          }),
+        ),
+        Effect.provide(BunFileSystem.layer),
+        (effect) => withEnvVar("SUPABASE_HOME", workdir.current, effect),
+        (effect) => withEnvVar("SUPABASE_TRACE_FILE", traceFile, effect),
+        (effect) => withEnvVar("SUPABASE_OTLP_ENDPOINT", undefined, effect),
+        (effect) => withEnvVar("SUPABASE_TELEMETRY_DISABLED", "1", effect),
+        Effect.ensuring(
+          Effect.sync(() => {
+            process.argv = initialArgv;
+            process.exitCode = initialCode;
+            exitSpy.mockRestore();
+          }),
+        ),
+        Effect.asVoid,
       );
     },
   );

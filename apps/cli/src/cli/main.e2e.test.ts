@@ -102,8 +102,7 @@ describe("CLI output to a closed pipe", () => {
     }
   };
 
-  // A held request makes text output print its clack progress line, the listener-less write after
-  // which the CLI used to hang; the JSON rows hit the closed pipe in the output sink instead.
+  // A held request exposes the clack progress write; JSON output writes through the stdio sink.
   test.skipIf(process.platform === "win32").each<[string[], boolean]>([
     [[], true],
     [["-o", "json"], false],
@@ -112,6 +111,7 @@ describe("CLI output to a closed pipe", () => {
     const result = await projectsList(args, { holdRequests, closedPipe: "stdout" });
 
     expect(result.exitCode, result.stderr).toBe(141);
+    expect(result.stderr).toBe("");
   });
 
   test
@@ -122,7 +122,7 @@ describe("CLI output to a closed pipe", () => {
       const result = await projectsList(["-o", "json"], { closedPipe: "stderr", env });
       expect(result.exitCode, JSON.stringify(result)).toBe(141);
       expect(result.timedOutAfterMs).toBeUndefined();
-      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe("");
     },
   );
 

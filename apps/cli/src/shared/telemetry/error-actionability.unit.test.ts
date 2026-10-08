@@ -1,4 +1,4 @@
-import { Cause, Data } from "effect";
+import { PlatformError, Cause, Data } from "effect";
 import { CliError } from "effect/unstable/cli";
 import { describe, expect, it } from "vitest";
 import { SupabaseApiInputError, markSupabaseApiInputErrorAsUserInput } from "@supabase/api/effect";
@@ -284,6 +284,34 @@ describe("classifyCliCauseActionability", () => {
       error_fingerprint: "error:Interrupt",
     });
   });
+
+  it.each(["stdout", "stderr"])(
+    "classifies %s EPIPE as cancellation without hiding other defects",
+    (method) => {
+      const error = PlatformError.systemError({
+        module: "Stdio",
+        method,
+        _tag: "Unknown",
+        cause: Object.assign(new Error("private"), { code: "EPIPE" }),
+      });
+      for (const cause of [Cause.fail(error), Cause.die(error)]) {
+        expect(classifyCliCauseActionability(cause)).toMatchObject({
+          error_kind: "user_cancelled",
+          error_fingerprint: "error:ClosedStdioPipe",
+        });
+        expect(
+          classifyCliCauseActionability(Cause.combine(cause, Cause.die(new TypeError("bug")))),
+        ).toMatchObject({ error_kind: "internal_bug", error_fingerprint: "error:TypeError" });
+      }
+      const other = PlatformError.systemError({
+        module: "Stdio",
+        method,
+        _tag: "Unknown",
+        cause: Object.assign(new Error("private"), { code: "ENOSPC" }),
+      });
+      expect(classifyCliCauseActionability(Cause.die(other)).error_kind).toBe("internal_bug");
+    },
+  );
 
   it("prefers an internal defect when a cause contains mixed failure reasons", () => {
     const cause = Cause.combine(

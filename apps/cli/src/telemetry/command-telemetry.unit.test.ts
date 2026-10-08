@@ -1,3 +1,6 @@
+import { GoChildExitError } from "../command-internal/go-child-exit.error.ts";
+import { PassThrough } from "node:stream";
+import { withStdioPipeHandling } from "../shared/runtime/process-control.layer.ts";
 import { describe, expect, it } from "@effect/vitest";
 import { BunCrypto } from "@effect/platform-bun";
 import { Cause, Effect, Exit, Layer, Option, Stdio } from "effect";
@@ -739,36 +742,46 @@ describe("withCommandTelemetry", () => {
     );
   });
 
-  it.live("adds sanitized metadata from the original typed failure", () => {
-    const analytics = mockContextualAnalytics();
-    const secret = "dump failed for postgres://customer.internal/private";
+  it.live.each(["database", "delegated"] as const)(
+    "adds sanitized metadata from the original %s failure",
+    (kind) => {
+      const analytics = mockContextualAnalytics();
+      const secret = "dump failed for postgres://customer.internal/private";
 
-    return withCommandTelemetry()(Effect.fail(new DbDumpRunError({ message: secret }))).pipe(
-      Effect.provide(analytics.layer),
-      Effect.provide(mockProcessControl().layer),
-      Effect.provide(mockOutput({ format: "text" }).layer),
-      Effect.provide(Stdio.layerTest({ args: Effect.succeed(["backups", "list"]) })),
-      Effect.provide(commandRuntimeLayer(["backups", "list"]).pipe(Layer.provide(BunCrypto.layer))),
-      Effect.exit,
-      Effect.tap(() =>
-        Effect.sync(() => {
-          expect(analytics.captured).toHaveLength(1);
-          expect(analytics.captured[0]?.properties).toMatchObject({
-            exit_code: 1,
-            error_kind: "user_actionable",
-            error_category: "db_connection",
-            error_fingerprint: "tag:DbDumpRunError",
-            has_suggestion: true,
-            suggestion_type: "update_config",
-          });
-          expect(analytics.captured[0]?.properties).not.toHaveProperty(PropSuggestedCommand);
-          expect(analytics.captured[0]?.properties).not.toHaveProperty(PropWorkflow);
-          expect(JSON.stringify(analytics.captured[0])).not.toContain(secret);
-        }),
-      ),
-      Effect.asVoid,
-    );
-  });
+      const failure =
+        kind === "database"
+          ? new DbDumpRunError({ message: secret })
+          : new GoChildExitError({ exitCode: 141, message: secret });
+      return withCommandTelemetry()(Effect.fail(failure)).pipe(
+        Effect.provide(analytics.layer),
+        Effect.provide(mockProcessControl().layer),
+        Effect.provide(mockOutput({ format: "text" }).layer),
+        Effect.provide(Stdio.layerTest({ args: Effect.succeed(["backups", "list"]) })),
+        Effect.provide(
+          commandRuntimeLayer(["backups", "list"]).pipe(Layer.provide(BunCrypto.layer)),
+        ),
+        Effect.exit,
+        Effect.tap(() =>
+          Effect.sync(() => {
+            expect(analytics.captured).toHaveLength(1);
+            expect(analytics.captured[0]?.properties).toMatchObject({
+              exit_code: 1,
+              error_kind: kind === "database" ? "user_actionable" : "unknown",
+              error_category: kind === "database" ? "db_connection" : "unknown",
+              error_fingerprint:
+                kind === "database" ? "tag:DbDumpRunError" : "tag:GoChildExitError",
+              has_suggestion: kind === "database",
+              suggestion_type: kind === "database" ? "update_config" : "none",
+            });
+            expect(analytics.captured[0]?.properties).not.toHaveProperty(PropSuggestedCommand);
+            expect(analytics.captured[0]?.properties).not.toHaveProperty(PropWorkflow);
+            expect(JSON.stringify(analytics.captured[0])).not.toContain(secret);
+          }),
+        ),
+        Effect.asVoid,
+      );
+    },
+  );
 
   it.live("preserves the command failure when telemetry capture defects", () => {
     const failure = new DbDumpRunError({ message: "command failure" });
@@ -816,6 +829,49 @@ describe("withCommandTelemetry", () => {
       Effect.asVoid,
     );
   });
+
+  it.live.each(["lint", "advisors"])(
+    "classifies observed EPIPE instead of db %s fail-on while retaining unrelated exit 141",
+    (command) =>
+      Effect.gen(function* () {
+        for (const closedPipe of [false, true]) {
+          const analytics = mockContextualAnalytics();
+          const processControl = mockProcessControl();
+          const stdout = new PassThrough();
+          const stderr = new PassThrough();
+          const commandEffect = Effect.gen(function* () {
+            const pc = yield* ProcessControl;
+            yield* pc.setExitCode(141);
+            if (closedPipe)
+              stderr.emit("error", Object.assign(new Error("pipe"), { code: "EPIPE" }));
+          }).pipe(
+            withCommandTelemetry(),
+            Effect.uninterruptible,
+            Effect.provide(analytics.layer),
+            Effect.provide(processControl.layer),
+            Effect.provide(mockOutput({ format: "json" }).layer),
+            Effect.provide(Stdio.layerTest({ args: Effect.succeed(["db", command]) })),
+            Effect.provide(
+              commandRuntimeLayer(["db", command]).pipe(Layer.provide(BunCrypto.layer)),
+            ),
+          );
+          const exit = yield* withStdioPipeHandling(commandEffect, { stdout, stderr }).pipe(
+            Effect.exit,
+          );
+          expect(Exit.isFailure(exit)).toBe(closedPipe);
+          expect(analytics.captured).toHaveLength(1);
+          expect(analytics.captured[0]?.properties).toMatchObject({
+            exit_code: 1,
+            error_kind: closedPipe ? "user_cancelled" : "user_actionable",
+            error_fingerprint: closedPipe
+              ? "error:ClosedStdioPipe"
+              : command === "lint"
+                ? "tag:DbLintFailOnError"
+                : "tag:DbAdvisorsFailOnError",
+          });
+        }
+      }),
+  );
 
   it.live("classifies db lint machine-mode fail-on like its typed text-mode error", () => {
     const analytics = mockContextualAnalytics();
@@ -910,36 +966,39 @@ describe("withCommandTelemetry", () => {
     );
   });
 
-  it.live("uses a static unknown fallback for other process-controlled failures", () => {
-    const analytics = mockContextualAnalytics();
-    const processControl = mockProcessControl();
+  it.live.each([2, 141])(
+    "uses a static unknown fallback for other process-controlled exit %i",
+    (code) => {
+      const analytics = mockContextualAnalytics();
+      const processControl = mockProcessControl();
 
-    return Effect.gen(function* () {
-      const pc = yield* ProcessControl;
-      yield* pc.setExitCode(2);
-    }).pipe(
-      withCommandTelemetry(),
-      Effect.provide(analytics.layer),
-      Effect.provide(processControl.layer),
-      Effect.provide(mockOutput({ format: "text" }).layer),
-      Effect.provide(Stdio.layerTest({ args: Effect.succeed(["unknown", "command"]) })),
-      Effect.provide(
-        commandRuntimeLayer(["unknown", "command"]).pipe(Layer.provide(BunCrypto.layer)),
-      ),
-      Effect.tap(() =>
-        Effect.sync(() => {
-          expect(analytics.captured[0]?.properties).toMatchObject({
-            exit_code: 1,
-            error_kind: "unknown",
-            error_category: "unknown",
-            error_fingerprint: "error:ProcessControlledFailure",
-            has_suggestion: false,
-            suggestion_type: "none",
-          });
-        }),
-      ),
-    );
-  });
+      return Effect.gen(function* () {
+        const pc = yield* ProcessControl;
+        yield* pc.setExitCode(code);
+      }).pipe(
+        withCommandTelemetry(),
+        Effect.provide(analytics.layer),
+        Effect.provide(processControl.layer),
+        Effect.provide(mockOutput({ format: "text" }).layer),
+        Effect.provide(Stdio.layerTest({ args: Effect.succeed(["unknown", "command"]) })),
+        Effect.provide(
+          commandRuntimeLayer(["unknown", "command"]).pipe(Layer.provide(BunCrypto.layer)),
+        ),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            expect(analytics.captured[0]?.properties).toMatchObject({
+              exit_code: 1,
+              error_kind: "unknown",
+              error_category: "unknown",
+              error_fingerprint: "error:ProcessControlledFailure",
+              has_suggestion: false,
+              suggestion_type: "none",
+            });
+          }),
+        ),
+      );
+    },
+  );
 
   it.live(
     "records config diff --exit-code drift (exit 2) truthfully, without failure metadata",

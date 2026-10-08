@@ -256,11 +256,12 @@ Error codes enable LLM agents to handle errors programmatically, documentation t
 
 **Exit codes**:
 
-| Code | Meaning              |
-| ---- | -------------------- |
-| 0    | Success              |
-| 1    | Any error            |
-| 130  | Interrupted (Ctrl+C) |
+| Code | Meaning                           |
+| ---- | --------------------------------- |
+| 0    | Success                           |
+| 1    | Any error                         |
+| 130  | Interrupted (Ctrl+C)              |
+| 141  | Closed stdout/stderr pipe (EPIPE) |
 
 Error categorization (auth vs network vs usage) is communicated through the structured error output (`error.code` field in JSON), not through exit codes. This matches the convention used by most production CLIs (Terraform, kubectl, Wrangler, Vercel).
 

@@ -39,7 +39,12 @@ import { cliConfigProviderLayer } from "../config/cli-config-provider.layer.ts";
 import { cliProjectHomeLayer } from "../config/cli-project-home.layer.ts";
 import { cliProjectContextLayer } from "../config/cli-project-context.layer.ts";
 import { projectLinkStateLayer } from "../config/project-link-state.layer.ts";
-import { isClosedStdioPipe, processControlLayer } from "../runtime/process-control.layer.ts";
+import {
+  isClosedStdioPipe,
+  hasClosedStdioPipe,
+  processControlLayer,
+  withStdioPipeHandling,
+} from "../runtime/process-control.layer.ts";
 import { runtimeInfoLayer } from "../runtime/runtime-info.layer.ts";
 import { ttyLayer } from "../runtime/tty.layer.ts";
 import { CommandRuntime } from "../runtime/command-runtime.service.ts";
@@ -336,13 +341,7 @@ function formatterLayerFor(
     : CliOutput.layer(textCliOutputFormatter(context));
 }
 
-/**
- * Process exit code for a failed CLI run. Delegates to Effect's own `Runtime` exit-code protocol
- * rather than hand-rolling classification: a bare group command's default handler failing with
- * `ShowHelp({ errors: [] })` (no subcommand given) reads as exit `0`; a `ShowHelp` with a
- * non-empty `errors` array, or any other failure, falls back to exit `1`. An explicit `--help`
- * invocation never reaches this function — it exits 0 via the success path.
- */
+/** Maps interruption to 130, closed stdio to 141, and other failures through Effect’s exit-code protocol. */
 export function exitCodeForFailure(cause: Cause.Cause<unknown>): number {
   if (Cause.hasInterruptsOnly(cause)) return 130;
   if (isClosedStdioPipe(cause)) return 141;
@@ -351,7 +350,7 @@ export function exitCodeForFailure(cause: Cause.Cause<unknown>): number {
 
 /**
  * Whether `handledProgram` should render its generic `output.fail` stderr line for a failed run.
- * False for a clean exit (`0`), an interrupt (`130`), a closed stdio pipe (nobody would read it),
+ * False for a clean exit (`0`), an interrupt (`130`), a closed stdio pipe (silent like SIGPIPE),
  * and a `GoChildExitError` — a delegated Go child already wrote its own failure to the inherited
  * stderr, so a second line here would be redundant. Checked by concrete type rather than Effect's
  * shared `[Runtime.errorReported]` marker, since `CliError.ShowHelp` also sets that marker `false`
@@ -778,9 +777,17 @@ export const runCli = Effect.fnUntraced(function* <
               Effect.flatMap((code) =>
                 code === 0 ? Effect.succeed(code) : Effect.fail(new CliNonZeroExit(code)),
               ),
+              Effect.onInterrupt(() =>
+                hasClosedStdioPipe.pipe(
+                  Effect.flatMap((closedPipe) =>
+                    closedPipe ? Effect.annotateCurrentSpan("process.exit_code", 141) : Effect.void,
+                  ),
+                ),
+              ),
             ),
           ),
         ),
+        withStdioPipeHandling,
         (effect) => Effect.catchCauseIf(effect, isClosedStdioPipe, () => Effect.succeed(141)),
         Effect.catchTag("CliNonZeroExit", (failure) => Effect.succeed(failure.code)),
       );

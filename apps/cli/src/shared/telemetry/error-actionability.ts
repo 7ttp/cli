@@ -1,4 +1,5 @@
 import { Cause, Option, Predicate } from "effect";
+import { isClosedStdioPipe } from "../runtime/process-control.layer.ts";
 import type { CliError as EffectCliError } from "effect/unstable/cli";
 import type { StackError, StackFailureKind } from "@supabase/stack/effect";
 
@@ -1036,6 +1037,7 @@ export function unwrapNativeFailure(error: unknown): unknown {
 
 function classifyAtDepth(error: unknown, depth: number): CliErrorActionability {
   error = unwrapNativeFailure(error);
+  if (isClosedStdioPipe(Cause.fail(error))) return closedStdioPipeActionability;
   if (depth >= MAX_CAUSE_DEPTH) {
     return toActionability(actionability.unknown, "error", "CauseChainLimit");
   }
@@ -1131,4 +1133,11 @@ export const unknownProcessControlledFailureActionability: CliErrorActionability
   actionability.unknown,
   "error",
   "ProcessControlledFailure",
+);
+
+/** A downstream consumer closed a CLI output pipe. */
+export const closedStdioPipeActionability: CliErrorActionability = toActionability(
+  actionability.cancelled,
+  "error",
+  "ClosedStdioPipe",
 );

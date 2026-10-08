@@ -7,6 +7,7 @@ import {
 } from "../shared/runtime/command-runtime.service.ts";
 import { Output } from "../shared/output/output.service.ts";
 import { GLOBAL_FLAGS, OutputFlag, globalFlagValues } from "../command-internal/global-flags.ts";
+import { hasClosedStdioPipe } from "../shared/runtime/process-control.layer.ts";
 import { ProcessControl } from "../shared/runtime/process-control.service.ts";
 import { withAnalyticsContext } from "../shared/telemetry/analytics-context.ts";
 import { Analytics } from "../shared/telemetry/analytics.service.ts";
@@ -14,6 +15,7 @@ import { TelemetryRuntime } from "../shared/telemetry/runtime.service.ts";
 import {
   type CliErrorActionability,
   classifyCliErrorActionability,
+  closedStdioPipeActionability,
   unknownProcessControlledFailureActionability,
 } from "../shared/telemetry/error-actionability.ts";
 import { DbAdvisorsFailOnError } from "../commands/db/advisors/advisors.errors.ts";
@@ -416,11 +418,14 @@ function withCommandAnalyticsImplementation<Flags extends Record<string, unknown
         // found", not "command failed"), so its real exit code is recorded truthfully instead of
         // collapsing into the process-controlled failure bucket below.
         const processExitCode = yield* processControl.getExitCode;
+        const closedPipe = yield* hasClosedStdioPipe;
         const isConfigDiffDriftSignal =
-          Exit.isSuccess(exit) && command === "config diff" && processExitCode === 2;
+          Exit.isSuccess(exit) && !closedPipe && command === "config diff" && processExitCode === 2;
         const recordedExitCode = isConfigDiffDriftSignal
           ? 2
-          : Exit.isFailure(exit) || (processExitCode !== undefined && processExitCode !== 0)
+          : closedPipe ||
+              Exit.isFailure(exit) ||
+              (processExitCode !== undefined && processExitCode !== 0)
             ? 1
             : 0;
 
@@ -440,7 +445,11 @@ function withCommandAnalyticsImplementation<Flags extends Record<string, unknown
         const failureMetadata = Exit.isFailure(exit)
           ? failureTelemetryPropertiesForCause(exit.cause)
           : recordedExitCode === 1
-            ? toFailureTelemetryProperties(processControlledFailureActionability(command))
+            ? toFailureTelemetryProperties(
+                closedPipe
+                  ? closedStdioPipeActionability
+                  : processControlledFailureActionability(command),
+              )
             : {};
 
         yield* analytics
