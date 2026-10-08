@@ -1,5 +1,6 @@
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -411,10 +412,10 @@ export function spawnSupabase(
     execArgs = [
       "-c",
       options.closedPipe === "stderr"
-        ? 'mkfifo "$1" || exit; exec 3<> "$1"; exec 2> "$1"; exec 3>&-; shift; exec "$@"'
-        : 'mkfifo "$1" || exit; exec 3<> "$1"; exec > "$1"; exec 3>&-; shift; exec "$@"',
+        ? 'mkfifo "$1" || exit; exec 3<> "$1"; exec 2> "$1"; rm -- "$1" || exit; exec 3>&-; shift; exec "$@"'
+        : 'mkfifo "$1" || exit; exec 3<> "$1"; exec > "$1"; rm -- "$1" || exit; exec 3>&-; shift; exec "$@"',
       "sh",
-      path.join(homeDir, `${options.closedPipe}.fifo`),
+      path.join(homeDir, `${options.closedPipe}-${randomUUID()}.fifo`),
       execCmd,
       ...execArgs,
     ];

@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import {
@@ -57,6 +57,7 @@ describe("CLI output to a closed pipe", () => {
     options: {
       readonly holdRequests?: boolean;
       readonly closedPipe?: "stdout" | "stderr";
+      readonly home?: string;
       readonly env?: Record<string, string | undefined>;
     } = {},
   ) => {
@@ -69,9 +70,10 @@ describe("CLI output to a closed pipe", () => {
         return Response.json([]);
       },
     });
-    const home = makeTempHome();
+    let ownHome: ReturnType<typeof makeTempHome> | undefined;
+    const homeDir = options.home ?? (ownHome = makeTempHome()).dir;
     try {
-      const profilePath = path.join(home.dir, "closed-pipe-profile.yaml");
+      const profilePath = path.join(homeDir, "closed-pipe-profile.yaml");
       await writeFile(
         profilePath,
         [
@@ -84,8 +86,8 @@ describe("CLI output to a closed pipe", () => {
       );
 
       return await spawnSupabase(["projects", "list", ...args], {
-        cwd: home.dir,
-        home: home.dir,
+        cwd: homeDir,
+        home: homeDir,
         closedPipe: options.closedPipe,
         exitTimeoutMs: 30_000,
         env: {
@@ -99,7 +101,7 @@ describe("CLI output to a closed pipe", () => {
     } finally {
       release();
       await server.stop(true);
-      home[Symbol.dispose]();
+      ownHome?.[Symbol.dispose]();
     }
   };
 
@@ -114,6 +116,28 @@ describe("CLI output to a closed pipe", () => {
     expect(result.exitCode, result.stderr).toBe(141);
     expect(result.stderr).toBe("");
   });
+
+  test.skipIf(process.platform === "win32")(
+    "exits quietly with 141 on successive closed pipes in a caller-owned home",
+    async () => {
+      const home = makeTempHome();
+      try {
+        for (let invocation = 0; invocation < 2; invocation++) {
+          const result = await projectsList(["-o", "json"], {
+            closedPipe: "stdout",
+            home: home.dir,
+          });
+
+          expect(result.exitCode, JSON.stringify(result)).toBe(141);
+          expect(result.timedOutAfterMs).toBeUndefined();
+          expect(result.stderr).toBe("");
+          expect((await readdir(home.dir)).filter((name) => name.endsWith(".fifo"))).toEqual([]);
+        }
+      } finally {
+        home[Symbol.dispose]();
+      }
+    },
+  );
 
   test
     .skipIf(process.platform === "win32")
