@@ -371,7 +371,7 @@ export function spawnSupabase(
     cleanupProcessGroupOnClose?: boolean;
     /** Maximum time to wait for the process to exit before force-killing it. */
     exitTimeoutMs?: number;
-    /** POSIX only: start the CLI with this stream on a pipe whose reader has already exited. */
+    /** POSIX only: start the CLI with this stream on a pipe with no readers. */
     closedPipe?: "stdout" | "stderr";
   },
 ): SpawnedSupabase {
@@ -406,13 +406,13 @@ export function spawnSupabase(
   execCmd = "node";
   execArgs = [SHIM_PATH, ...args];
   if (options?.closedPipe) {
-    // The FIFO's only reader opens it and exits before the CLI starts, as `| true` does once
-    // `true` is gone, so every CLI write to the selected stream fails with EPIPE.
+    // A temporary read/write FD avoids a reader process whose exit can interrupt the shell's open.
+    // Close it before starting the CLI so the selected write-only stream has no readers.
     execArgs = [
       "-c",
       options.closedPipe === "stderr"
-        ? 'mkfifo "$1" || exit; true < "$1" & exec 2> "$1"; wait "$!"; shift; exec "$@"'
-        : 'mkfifo "$1" || exit; true < "$1" & exec > "$1"; wait "$!"; shift; exec "$@"',
+        ? 'mkfifo "$1" || exit; exec 3<> "$1"; exec 2> "$1"; exec 3>&-; shift; exec "$@"'
+        : 'mkfifo "$1" || exit; exec 3<> "$1"; exec > "$1"; exec 3>&-; shift; exec "$@"',
       "sh",
       path.join(homeDir, `${options.closedPipe}.fifo`),
       execCmd,
